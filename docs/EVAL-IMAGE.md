@@ -188,6 +188,12 @@ CI publishes `ghcr.io/cortexlm/relearn-eval` and prints the pushed
 control plane's `config/relearn-pin.toml`, together with this repo's git SHA in
 `relearn_git_sha`, and re-sign the trust root.
 
+A package GHCR created from a workflow starts **private**, and a Lium pod boots
+with no registry credential, so a one-time step is needed before the pin can be
+used: set the package's visibility to public (or give the pod a pull
+credential). The digest is what pins the image either way — visibility decides
+whether the pod can fetch it, not which bytes it gets.
+
 The pod's default command (`serve`) keeps the container reachable over SSH so
 the harvest can stage the request and run the scorer; any other argument list is
 passed straight to `relearn-eval`, which is how CI and a local operator drive

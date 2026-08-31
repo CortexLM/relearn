@@ -203,45 +203,21 @@ class TransformersRunner:
             self._processor = None
         self._tokenizer = AutoTokenizer.from_pretrained(weights)
 
-    #: Auto classes to try, in order. The base is a native VLM, so an
-    #: image-text-to-text class comes first; the name changed across
-    #: transformers majors (`AutoModelForVision2Seq` →
-    #: `AutoModelForImageTextToText`) and a text-only artifact needs neither, so
-    #: the image tries what the installed version actually has.
-    AUTO_CLASSES = (
-        "AutoModelForImageTextToText",
-        "AutoModelForVision2Seq",
-        "AutoModelForCausalLM",
-    )
-
-    @classmethod
-    def _load_weights(cls, weights: str):  # pragma: no cover - needs torch
-        """Load the weights with the first auto class that can take them."""
+    @staticmethod
+    def _load_weights(weights: str):  # pragma: no cover - needs torch
         import torch
-        import transformers
+        from transformers import AutoModelForCausalLM
 
-        def load(auto_class):
-            try:
-                return auto_class.from_pretrained(
-                    weights, dtype=torch.bfloat16, device_map="auto"
-                )
-            except TypeError:
-                # The dtype keyword was renamed (`torch_dtype` → `dtype`).
-                return auto_class.from_pretrained(
-                    weights, torch_dtype=torch.bfloat16, device_map="auto"
-                )
+        try:
+            from transformers import AutoModelForVision2Seq
 
-        last: Exception | None = None
-        for name in cls.AUTO_CLASSES:
-            auto_class = getattr(transformers, name, None)
-            if auto_class is None:
-                continue
-            try:
-                return load(auto_class)
-            except (OSError, ValueError, KeyError) as exc:
-                log.info("%s could not load these weights: %s", name, type(exc).__name__)
-                last = exc
-        raise RunnerError(f"no transformers auto class could load {weights}") from last
+            return AutoModelForVision2Seq.from_pretrained(
+                weights, dtype=torch.bfloat16, device_map="auto"
+            )
+        except (ImportError, OSError, ValueError, KeyError):
+            return AutoModelForCausalLM.from_pretrained(
+                weights, dtype=torch.bfloat16, device_map="auto"
+            )
 
     def generate(self, prompts: Sequence[Prompt]) -> list[str]:  # pragma: no cover
         import torch
@@ -297,12 +273,6 @@ def build_runner(base_model: str, artifact_dir: Path | None) -> ModelRunner:
         return TransformersRunner(weights, artifact_dir)
     try:
         return VllmRunner(weights, artifact_dir)
-    except (RunnerError, ImportError, OSError, RuntimeError, ValueError) as exc:
-        # `auto` means "whichever backend this pod can actually load". If
-        # transformers cannot load it either, that error is the run's failure.
-        log.warning(
-            "vllm backend unavailable (%s: %s); falling back to transformers",
-            type(exc).__name__,
-            exc,
-        )
+    except RunnerError as exc:
+        log.warning("vllm backend unavailable (%s); falling back to transformers", exc)
         return TransformersRunner(weights, artifact_dir)
