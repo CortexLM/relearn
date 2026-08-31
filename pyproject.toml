@@ -1,0 +1,56 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "relearn-eval"
+version = "1.0.0"
+description = "Relearn LLM live eval image: score a submitted artifact on the holdout the control plane delivers."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { file = "LICENSE" }
+dependencies = []
+
+# The scorer needs a model runtime. It is an extra so the contract layer can be
+# tested, linted, and built without pulling CUDA wheels; the published image is
+# built with it (`--build-arg WITH_RUNTIME=1`).
+[project.optional-dependencies]
+runtime = [
+  "torch>=2.4",
+  "transformers>=4.44",
+  "accelerate>=0.33",
+  "peft>=0.12",
+  "safetensors>=0.4",
+  "pillow>=10.3",
+  "numpy>=1.26",
+]
+vllm = ["vllm>=0.6"]
+dev = ["pytest>=8", "ruff>=0.6", "pillow>=10.3", "numpy>=1.26"]
+
+[project.scripts]
+relearn-eval = "relearn_eval.cli:main"
+
+[tool.setuptools]
+package-dir = { "" = "eval/src" }
+
+[tool.setuptools.packages.find]
+where = ["eval/src"]
+
+[tool.setuptools.package-data]
+relearn_eval = ["catalog/*.jsonl"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+filterwarnings = ["error"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+src = ["eval/src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "S", "RUF"]
+ignore = ["S101"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S105", "S106", "S311"]
