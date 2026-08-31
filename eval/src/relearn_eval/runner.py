@@ -205,19 +205,31 @@ class TransformersRunner:
 
     @staticmethod
     def _load_weights(weights: str):  # pragma: no cover - needs torch
+        """Load the weights as a VLM when the base is one, else as an LM.
+
+        The dtype keyword was renamed (`torch_dtype` → `dtype`), so both are
+        tried: the image has to work on whichever transformers the pod's base
+        layer ships.
+        """
         import torch
         from transformers import AutoModelForCausalLM
+
+        def load(auto_class):
+            try:
+                return auto_class.from_pretrained(
+                    weights, dtype=torch.bfloat16, device_map="auto"
+                )
+            except TypeError:
+                return auto_class.from_pretrained(
+                    weights, torch_dtype=torch.bfloat16, device_map="auto"
+                )
 
         try:
             from transformers import AutoModelForVision2Seq
 
-            return AutoModelForVision2Seq.from_pretrained(
-                weights, dtype=torch.bfloat16, device_map="auto"
-            )
+            return load(AutoModelForVision2Seq)
         except (ImportError, OSError, ValueError, KeyError):
-            return AutoModelForCausalLM.from_pretrained(
-                weights, dtype=torch.bfloat16, device_map="auto"
-            )
+            return load(AutoModelForCausalLM)
 
     def generate(self, prompts: Sequence[Prompt]) -> list[str]:  # pragma: no cover
         import torch
@@ -273,6 +285,12 @@ def build_runner(base_model: str, artifact_dir: Path | None) -> ModelRunner:
         return TransformersRunner(weights, artifact_dir)
     try:
         return VllmRunner(weights, artifact_dir)
-    except RunnerError as exc:
-        log.warning("vllm backend unavailable (%s); falling back to transformers", exc)
+    except (RunnerError, ImportError, OSError, RuntimeError, ValueError) as exc:
+        # `auto` means "whichever backend this pod can actually load". If
+        # transformers cannot load it either, that error is the run's failure.
+        log.warning(
+            "vllm backend unavailable (%s: %s); falling back to transformers",
+            type(exc).__name__,
+            exc,
+        )
         return TransformersRunner(weights, artifact_dir)
