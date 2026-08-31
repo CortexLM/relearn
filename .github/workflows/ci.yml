@@ -1,0 +1,115 @@
+name: ci
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+      - name: ruff
+        run: ruff check .
+      - name: contract tests
+        run: pytest -q
+
+  image-contract:
+    # Builds the image and drives it exactly as the harvest does: request on
+    # stdin, `relearn-eval score`, then read the markers back. A pod with no
+    # judge and no model runtime must refuse rather than print a document, so
+    # that is what this asserts.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: docker/setup-buildx-action@v3
+      - name: build the contract image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: eval/Dockerfile
+          load: true
+          tags: relearn-eval:ci
+          build-args: |
+            WITH_RUNTIME=0
+            RELEARN_GIT_SHA=${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: stage a dev request
+        run: |
+          pip install -e .
+          python tests/tools/make_request.py --size 8 > "${RUNNER_TEMP}/request.json"
+
+      - name: the entrypoint runs the scorer
+        run: |
+          docker run --rm relearn-eval:ci --help | tee /dev/stderr | grep -q "score"
+
+      - name: a pod with no judge refuses, with no document and no OK marker
+        run: |
+          set +e
+          out=$(docker run --rm -i relearn-eval:ci score --request - --out /tmp/metrics.json \
+                  < "${RUNNER_TEMP}/request.json" 2>"${RUNNER_TEMP}/stderr.log")
+          rc=$?
+          set -e
+          echo "exit=${rc}"
+          cat "${RUNNER_TEMP}/stderr.log"
+          test "${rc}" -ne 0
+          if echo "${out}" | grep -q "RELEARN_EVAL_OK"; then
+            echo "a pod that could not score printed the completion marker"; exit 1
+          fi
+          if echo "${out}" | grep -q "RELEARN_METRICS="; then
+            echo "a pod that could not score printed a document"; exit 1
+          fi
+          grep -q "RELEARN_TEACHER_API_URL" "${RUNNER_TEMP}/stderr.log"
+
+      - name: a tampered request is refused
+        run: |
+          python - "${RUNNER_TEMP}/request.json" > "${RUNNER_TEMP}/tampered.json" <<'PY'
+          import json, sys
+          body = json.load(open(sys.argv[1]))
+          body["holdout"][0]["prompt"] = "an item the commitment does not cover"
+          json.dump(body, sys.stdout)
+          PY
+          set +e
+          docker run --rm -i relearn-eval:ci score --request - \
+            < "${RUNNER_TEMP}/tampered.json" 2>"${RUNNER_TEMP}/tampered.log"
+          rc=$?
+          set -e
+          test "${rc}" -ne 0
+          grep -q "commitment mismatch" "${RUNNER_TEMP}/tampered.log"
+
+      - name: silence is not a score
+        run: |
+          printf 'boot ok\nsegfault\n' > "${RUNNER_TEMP}/silent.log"
+          printf 'boot ok\nRELEARN_EVAL_OK\n' > "${RUNNER_TEMP}/marker-only.log"
+          for transcript in silent marker-only; do
+            set +e
+            docker run --rm -v "${RUNNER_TEMP}:/run:ro" relearn-eval:ci \
+              verify --request /run/request.json --transcript "/run/${transcript}.log" \
+              2>"${RUNNER_TEMP}/${transcript}.verify.log"
+            rc=$?
+            set -e
+            cat "${RUNNER_TEMP}/${transcript}.verify.log"
+            test "${rc}" -ne 0
+          done
+          grep -q "did not print RELEARN_EVAL_OK" "${RUNNER_TEMP}/silent.verify.log"
+          grep -q "printed no RELEARN_METRICS=" "${RUNNER_TEMP}/marker-only.verify.log"
