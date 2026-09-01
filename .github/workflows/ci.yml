@@ -113,3 +113,127 @@ jobs:
           done
           grep -q "did not print RELEARN_EVAL_OK" "${RUNNER_TEMP}/silent.verify.log"
           grep -q "printed no RELEARN_METRICS=" "${RUNNER_TEMP}/marker-only.verify.log"
+
+  challenge-image-contract:
+    # The same exercise for the two newer eval images: build the contract
+    # image, drive it exactly as the harvest does (request on stdin, `score`,
+    # read the markers back), and assert that a pod with no judge and no model
+    # runtime refuses rather than printing a document.
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - challenge: image
+            binary: relearn-image-eval
+            builder: tests/tools/make_image_request.py
+            builder_args: "--prompts 25"
+            judge_env: RELEARN_IMAGE_JUDGE_API_URL
+            tamper: |
+              body["holdout"][0]["text"] = "a prompt the commitment does not cover"
+          - challenge: agent
+            binary: relearn-agent-eval
+            builder: tests/tools/make_agent_request.py
+            builder_args: "--traces 100"
+            judge_env: RELEARN_AGENT_TEACHER_API_URL
+            tamper: |
+              body["holdout"][0]["steps"][0]["observation"] = "an observation nobody committed"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: docker/setup-buildx-action@v3
+      - name: build the contract image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: eval/Dockerfile.challenge
+          load: true
+          tags: ${{ matrix.binary }}:ci
+          build-args: |
+            CHALLENGE=${{ matrix.challenge }}
+            WITH_RUNTIME=0
+            RELEARN_GIT_SHA=${{ github.sha }}
+          cache-from: type=gha,scope=${{ matrix.challenge }}-ci
+          cache-to: type=gha,mode=max,scope=${{ matrix.challenge }}-ci
+
+      - name: stage a dev request
+        run: |
+          pip install -e .
+          python ${{ matrix.builder }} ${{ matrix.builder_args }} \
+            > "${RUNNER_TEMP}/request.json"
+
+      - name: the entrypoint runs this challenge's scorer
+        run: |
+          docker run --rm ${{ matrix.binary }}:ci --help | tee /dev/stderr | grep -q "score"
+
+      - name: a pod with no judge refuses, with no document and no OK marker
+        run: |
+          set +e
+          out=$(docker run --rm -i ${{ matrix.binary }}:ci score --request - \
+                  --out /tmp/metrics.json < "${RUNNER_TEMP}/request.json" \
+                  2>"${RUNNER_TEMP}/stderr.log")
+          rc=$?
+          set -e
+          echo "exit=${rc}"
+          cat "${RUNNER_TEMP}/stderr.log"
+          test "${rc}" -ne 0
+          if echo "${out}" | grep -q "RELEARN_EVAL_OK"; then
+            echo "a pod that could not score printed the completion marker"; exit 1
+          fi
+          if echo "${out}" | grep -q "RELEARN_METRICS="; then
+            echo "a pod that could not score printed a document"; exit 1
+          fi
+          grep -q "${{ matrix.judge_env }}" "${RUNNER_TEMP}/stderr.log"
+
+      - name: a tampered request is refused
+        run: |
+          python - "${RUNNER_TEMP}/request.json" > "${RUNNER_TEMP}/tampered.json" <<'PY'
+          import json, sys
+          body = json.load(open(sys.argv[1]))
+          ${{ matrix.tamper }}
+          json.dump(body, sys.stdout)
+          PY
+          set +e
+          docker run --rm -i ${{ matrix.binary }}:ci score --request - \
+            < "${RUNNER_TEMP}/tampered.json" 2>"${RUNNER_TEMP}/tampered.log"
+          rc=$?
+          set -e
+          cat "${RUNNER_TEMP}/tampered.log"
+          test "${rc}" -ne 0
+          grep -q "commitment mismatch" "${RUNNER_TEMP}/tampered.log"
+
+      - name: silence is not a score
+        run: |
+          printf 'boot ok\nsegfault\n' > "${RUNNER_TEMP}/silent.log"
+          printf 'boot ok\nRELEARN_EVAL_OK\n' > "${RUNNER_TEMP}/marker-only.log"
+          for transcript in silent marker-only; do
+            set +e
+            docker run --rm -v "${RUNNER_TEMP}:/run:ro" ${{ matrix.binary }}:ci \
+              verify --request /run/request.json --transcript "/run/${transcript}.log" \
+              2>"${RUNNER_TEMP}/${transcript}.verify.log"
+            rc=$?
+            set -e
+            cat "${RUNNER_TEMP}/${transcript}.verify.log"
+            test "${rc}" -ne 0
+          done
+          grep -q "did not print RELEARN_EVAL_OK" "${RUNNER_TEMP}/silent.verify.log"
+          grep -q "printed no RELEARN_METRICS=" "${RUNNER_TEMP}/marker-only.verify.log"
+
+      - name: a request for another challenge is refused
+        run: |
+          python - "${RUNNER_TEMP}/request.json" > "${RUNNER_TEMP}/other.json" <<'PY'
+          import json, sys
+          body = json.load(open(sys.argv[1]))
+          body["challenge_id"] = "bounty"
+          json.dump(body, sys.stdout)
+          PY
+          set +e
+          docker run --rm -i ${{ matrix.binary }}:ci score --request - \
+            < "${RUNNER_TEMP}/other.json" 2>"${RUNNER_TEMP}/other.log"
+          rc=$?
+          set -e
+          cat "${RUNNER_TEMP}/other.log"
+          test "${rc}" -ne 0
+          grep -q "not scored by this image" "${RUNNER_TEMP}/other.log"

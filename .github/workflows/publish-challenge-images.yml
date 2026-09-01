@@ -1,0 +1,173 @@
+name: publish-challenge-images
+
+# Publishes the two newer eval images and prints the pushed sha256 digests:
+#
+#   ghcr.io/cortexlm/relearn-image-eval   (challenge relearn-image)
+#   ghcr.io/cortexlm/relearn-agent-eval   (challenge relearn-agent)
+#
+# Those digests are what the control plane pins; a tag is never the pin.
+#
+# The Relearn LLM image publishes from `publish-eval-image.yml` and is untouched
+# by this workflow. It is already pinned by digest in
+# `config/relearn-pin.toml`, so its build must not become a dependency of these.
+#
+# Two images per challenge, from the same Dockerfile:
+#
+#   :<sha>            the scoring image — full model runtime. Pin this.
+#   :<sha>-contract   contract only, no CUDA wheels. Fast, and cannot score.
+#
+# The contract images publish first and independently, so a runtime build that
+# runs out of runner disk cannot take the whole publish down with it.
+
+on:
+  push:
+    branches: ["main", "cursor/**"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: publish-challenges-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  contract:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - challenge: image
+            image: relearn-image-eval
+          - challenge: agent
+            image: relearn-agent-eval
+    steps:
+      - uses: actions/checkout@v4
+      - name: resolve the image name
+        # A registry repository must be lowercase; the owner is CortexLM.
+        run: |
+          echo "IMAGE=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/${{ matrix.image }}" >> "${GITHUB_ENV}"
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: build and push the contract image
+        id: push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: eval/Dockerfile.challenge
+          push: true
+          provenance: false
+          tags: |
+            ${{ env.IMAGE }}:${{ github.sha }}-contract
+          build-args: |
+            CHALLENGE=${{ matrix.challenge }}
+            WITH_RUNTIME=0
+            RELEARN_GIT_SHA=${{ github.sha }}
+          cache-from: type=gha,scope=${{ matrix.challenge }}-contract
+          cache-to: type=gha,mode=max,scope=${{ matrix.challenge }}-contract
+      - name: report
+        run: |
+          {
+            echo "### ${{ matrix.image }} (contract only)"
+            echo
+            echo '```'
+            echo "image  = \"${IMAGE}\""
+            echo "digest = \"${{ steps.push.outputs.digest }}\""
+            echo '```'
+            echo
+            echo "Contract layer only: no model runtime, so it refuses to score."
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+  runtime:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - challenge: image
+            image: relearn-image-eval
+            # The same manifest is pushed under the name cortex's
+            # `config/relearn-t2i-pin.toml` already carries, so the digest can
+            # be pinned before the `relearn-t2i` -> `relearn-image` rename
+            # lands there. One build, one digest, two names.
+            alias: relearn-t2i-eval
+          - challenge: agent
+            image: relearn-agent-eval
+            alias: ""
+    steps:
+      - uses: actions/checkout@v4
+      - name: resolve the image names
+        run: |
+          owner="${GITHUB_REPOSITORY_OWNER,,}"
+          echo "IMAGE=ghcr.io/${owner}/${{ matrix.image }}" >> "${GITHUB_ENV}"
+          if [ -n "${{ matrix.alias }}" ]; then
+            echo "ALIAS=ghcr.io/${owner}/${{ matrix.alias }}" >> "${GITHUB_ENV}"
+          else
+            echo "ALIAS=" >> "${GITHUB_ENV}"
+          fi
+      - name: compose the tag list
+        run: |
+          {
+            echo "TAGS<<TAGS_EOF"
+            echo "${IMAGE}:${GITHUB_SHA}"
+            if [ -n "${ALIAS}" ]; then
+              echo "${ALIAS}:${GITHUB_SHA}"
+            fi
+            echo "TAGS_EOF"
+          } >> "${GITHUB_ENV}"
+      - name: free disk for the runtime wheels
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /opt/hostedtoolcache/CodeQL /usr/local/share/boost || true
+          df -h /
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: build and push the scoring image
+        id: push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: eval/Dockerfile.challenge
+          push: true
+          provenance: false
+          tags: ${{ env.TAGS }}
+          build-args: |
+            CHALLENGE=${{ matrix.challenge }}
+            WITH_RUNTIME=1
+            RELEARN_GIT_SHA=${{ github.sha }}
+          # No layer cache: the runtime wheels are several GiB, which is past
+          # what the Actions cache will hold, and a failed cache export would
+          # fail a build that otherwise produced a pinnable digest.
+      - name: report the digest to pin
+        run: |
+          digest='${{ steps.push.outputs.digest }}'
+          case "${digest}" in
+            sha256:*) ;;
+            *) echo "no sha256 digest was published"; exit 1 ;;
+          esac
+          {
+            echo "### ${{ matrix.image }} (scoring image)"
+            echo
+            echo "Paste into the control plane's pin for challenge relearn-${{ matrix.challenge }}:"
+            echo
+            echo '```toml'
+            echo "eval_image = \"${IMAGE}\""
+            echo "eval_image_digest = \"${digest}\""
+            echo "relearn_git_sha = \"${GITHUB_SHA}\""
+            echo '```'
+            if [ -n "${ALIAS}" ]; then
+              echo
+              echo "Also pushed as \`${ALIAS}:${GITHUB_SHA}\` — same manifest, same digest."
+            fi
+          } >> "${GITHUB_STEP_SUMMARY}"
+          echo "eval_image_digest = \"${digest}\""

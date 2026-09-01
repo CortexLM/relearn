@@ -22,4 +22,22 @@ came from the pinned eval image (`lium`) or an operator's offline harness
 Eval image contract and how your artifact is loaded and scored:
 [`EVAL-IMAGE.md`](./EVAL-IMAGE.md).
 
+## The other two eval images in this repo
+
+The subnet runs more than one Relearn challenge, and each has its own live
+scorer, its own image, and its own entrypoint. Nothing above applies to them
+unchanged.
+
+| Challenge | What you post-train | Contract |
+|---|---|---|
+| `relearn` | `Qwen/Qwen3.8-27B`, judged on prompts | [`EVAL-IMAGE.md`](./EVAL-IMAGE.md) |
+| `relearn-image` | `nvidia/Cosmos3-Super-Text2Image`, judged by Q-Judger | [`IMAGE-EVAL-IMAGE.md`](./IMAGE-EVAL-IMAGE.md) |
+| `relearn-agent` | `Qwen/Qwen3.8-27B`, replayed against recorded tool traces | [`AGENT-EVAL-IMAGE.md`](./AGENT-EVAL-IMAGE.md) |
+
+`relearn-agent` shares a base checkpoint with `relearn` and nothing else. It
+grades the action you take at each step against what was actually recorded, and
+it replays every episode again with the tool results withheld: a model that
+ignores what its tools returned does not lose ground on that replay, and that is
+what fails it.
+
 Control plane: <https://github.com/CortexLM/cortex>
