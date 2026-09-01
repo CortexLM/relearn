@@ -9,7 +9,7 @@ this challenge refuses.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
 
 import pytest
@@ -17,6 +17,7 @@ import pytest
 from relearn_eval import HarvestRequest, HoldoutItem
 from relearn_eval.commitment import holdout_commitment
 from relearn_eval.contract import METRICS_SCHEMA_VERSION
+from relearn_eval.preflight import Ready
 from relearn_eval.runner import Prompt
 from relearn_eval.scoring import Slices
 
@@ -51,13 +52,14 @@ def make_request(
     submission_digest: str = "frozen-1",
     artifact_digest: str = "ab" * 32,
     eval_image_digest: str = IMAGE_DIGEST,
+    base_model: str = "Qwen/Qwen3.8-27B",
 ) -> HarvestRequest:
     holdout = tuple(items if items is not None else holdout_items())
     return HarvestRequest(
         schema_version=METRICS_SCHEMA_VERSION,
         submission_digest=submission_digest,
         artifact_digest=artifact_digest,
-        base_model="Qwen/Qwen3.8-27B",
+        base_model=base_model,
         teacher_model="glm-5.3",
         eval_image_digest=eval_image_digest,
         holdout_commitment=holdout_commitment(holdout),
@@ -87,11 +89,20 @@ class FakeTeacher:
     """A judge stand-in. Returns a fixed level so tests can assert plumbing."""
 
     level: float = 0.61
+    model: str = "glm-5.3"
     calls: list[tuple[str, str]] = field(default_factory=list)
 
     def judge(self, prompt: str, candidate: str) -> float:
         self.calls.append((prompt, candidate))
         return self.level
+
+    def judge_all(self, pairs: Iterable[tuple[str, str]]) -> list[float]:
+        return [self.judge(prompt, candidate) for prompt, candidate in pairs]
+
+
+def ready(teacher: FakeTeacher, base_model: str = "Qwen/Qwen3.8-27B") -> Ready:
+    """A preflight result for a pod that has everything it needs."""
+    return Ready(teacher=teacher, base_model=base_model, artifact_dir=None)
 
 
 @pytest.fixture

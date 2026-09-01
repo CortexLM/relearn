@@ -20,7 +20,7 @@ import pytest
 from relearn_eval import METRICS_MARKER, OK_MARKER
 from relearn_eval.cli import main
 
-from .conftest import FakeRunner, FakeTeacher, holdout_items, make_request
+from .conftest import FakeRunner, FakeTeacher, holdout_items, make_request, ready
 
 PACKAGE = Path(__file__).resolve().parents[1] / "eval" / "src" / "relearn_eval"
 REPO = Path(__file__).resolve().parents[1]
@@ -55,9 +55,8 @@ def test_stdout_carries_no_holdout_prompt(tmp_path, monkeypatch, capsys):
     request = make_request(holdout_items(8))
     path = tmp_path / "request.json"
     path.write_text(json.dumps(request.to_wire()), encoding="utf-8")
+    monkeypatch.setattr("relearn_eval.cli.preflight", lambda *_a, **_k: ready(FakeTeacher()))
     monkeypatch.setattr("relearn_eval.cli.build_runner", lambda *_: FakeRunner())
-    monkeypatch.setattr("relearn_eval.cli.build_teacher", lambda *_: FakeTeacher())
-    monkeypatch.setattr("relearn_eval.cli.resolve_artifact", lambda *_a, **_k: None)
 
     assert (
         main(
@@ -86,9 +85,8 @@ def test_the_document_carries_ids_not_prompts(tmp_path, monkeypatch, capsys):
     request = make_request(holdout_items(4))
     path = tmp_path / "request.json"
     path.write_text(json.dumps(request.to_wire()), encoding="utf-8")
+    monkeypatch.setattr("relearn_eval.cli.preflight", lambda *_a, **_k: ready(FakeTeacher()))
     monkeypatch.setattr("relearn_eval.cli.build_runner", lambda *_: FakeRunner())
-    monkeypatch.setattr("relearn_eval.cli.build_teacher", lambda *_: FakeTeacher())
-    monkeypatch.setattr("relearn_eval.cli.resolve_artifact", lambda *_a, **_k: None)
     main(
         [
             "score",

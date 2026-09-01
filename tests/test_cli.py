@@ -18,11 +18,11 @@ import pytest
 
 from relearn_eval import METRICS_MARKER, OK_MARKER, accept, decode_document
 from relearn_eval.cli import EXIT_REFUSED, main
+from relearn_eval.preflight import PreflightError
 from relearn_eval.request import HarvestRequest
 from relearn_eval.scoring import Slices
-from relearn_eval.teacher import TeacherError
 
-from .conftest import FakeRunner, FakeTeacher, holdout_items, make_request
+from .conftest import FakeRunner, FakeTeacher, holdout_items, make_request, ready
 
 
 @pytest.fixture
@@ -35,12 +35,15 @@ def staged(tmp_path):
 
 @pytest.fixture
 def wired(monkeypatch):
-    """Stand in for the two things the image cannot carry: model and judge."""
+    """Stand in for the two things the image cannot carry: model and judge.
+
+    Patched at the preflight seam, which is where the real run proves the
+    judge answers and the weights are on the pod.
+    """
     runner = FakeRunner()
     teacher = FakeTeacher()
+    monkeypatch.setattr("relearn_eval.cli.preflight", lambda *_a, **_k: ready(teacher))
     monkeypatch.setattr("relearn_eval.cli.build_runner", lambda *_: runner)
-    monkeypatch.setattr("relearn_eval.cli.build_teacher", lambda *_: teacher)
-    monkeypatch.setattr("relearn_eval.cli.resolve_artifact", lambda *_a, **_k: None)
     return runner, teacher
 
 
@@ -91,9 +94,10 @@ def test_a_judge_score_that_does_not_round_cleanly_still_publishes(
     staged, tmp_path, monkeypatch, capsys
 ):
     """Publishing rounds the scores, so the self-check compares encoded forms."""
+    monkeypatch.setattr(
+        "relearn_eval.cli.preflight", lambda *_a, **_k: ready(FakeTeacher(level=2 / 3))
+    )
     monkeypatch.setattr("relearn_eval.cli.build_runner", lambda *_: FakeRunner())
-    monkeypatch.setattr("relearn_eval.cli.build_teacher", lambda *_: FakeTeacher(level=2 / 3))
-    monkeypatch.setattr("relearn_eval.cli.resolve_artifact", lambda *_a, **_k: None)
     request, _ = staged
 
     assert run_score(staged, tmp_path) == 0
@@ -126,8 +130,10 @@ def test_an_unreachable_judge_refuses_without_a_marker_or_a_sidecar(
     staged, tmp_path, monkeypatch, capsys
 ):
     monkeypatch.setattr(
-        "relearn_eval.cli.build_teacher",
-        lambda *_: (_ for _ in ()).throw(TeacherError("RELEARN_TEACHER_API_URL is unset")),
+        "relearn_eval.cli.preflight",
+        lambda *_a, **_k: (_ for _ in ()).throw(
+            PreflightError("no judge: RELEARN_TEACHER_API_URL is unset")
+        ),
     )
     assert run_score(staged, tmp_path) == EXIT_REFUSED
     assert capsys.readouterr().out == ""
@@ -162,7 +168,7 @@ def test_a_tampered_request_is_refused_before_the_model_is_loaded(
     monkeypatch.setattr(
         "relearn_eval.cli.build_runner", lambda *_: loaded.append("loaded") or FakeRunner()
     )
-    monkeypatch.setattr("relearn_eval.cli.build_teacher", lambda *_: FakeTeacher())
+    monkeypatch.setattr("relearn_eval.cli.preflight", lambda *_a, **_k: ready(FakeTeacher()))
     request = make_request(holdout_items(8))
     wire = request.to_wire()
     wire["holdout_commitment"] = "aa" * 32
@@ -183,9 +189,8 @@ def test_the_runner_is_released_even_when_scoring_fails(staged, tmp_path, monkey
     def explode(*_args, **_kwargs):
         raise RuntimeError("cuda out of memory")
 
+    monkeypatch.setattr("relearn_eval.cli.preflight", lambda *_a, **_k: ready(FakeTeacher()))
     monkeypatch.setattr("relearn_eval.cli.build_runner", lambda *_: runner)
-    monkeypatch.setattr("relearn_eval.cli.build_teacher", lambda *_: FakeTeacher())
-    monkeypatch.setattr("relearn_eval.cli.resolve_artifact", lambda *_a, **_k: None)
     monkeypatch.setattr("relearn_eval.cli.score_request", explode)
     assert run_score(staged, tmp_path) != 0
     assert runner.closed
