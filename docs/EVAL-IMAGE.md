@@ -160,6 +160,7 @@ knows. All of it is pod environment the operator sets.
 | `RELEARN_TEACHER_API_URL` | OpenAI-compatible judge endpoint. **Required**: with no judge the run fails |
 | `RELEARN_TEACHER_API_KEY` | Bearer for that endpoint. Never logged |
 | `RELEARN_TEACHER_MODEL` | Wire id override (default `glm-5.3`) |
+| `RELEARN_TEACHER_MAX_TOKENS` | Judge completion budget (default 1024). GLM-5.3 thinking is mandatory; 32 tokens is spent on the think block and `content` comes back null |
 | `RELEARN_JUDGE_CONCURRENCY` | Judge calls in flight (default 8) |
 | `RELEARN_JUDGE_ATTEMPTS`, `RELEARN_JUDGE_RETRY_SECS` | Retry budget per judge call |
 | `RELEARN_BASE_MODEL_DIR` | Local base weights. **Strongly recommended**: without it the run needs a warm cache or the download opt-in |

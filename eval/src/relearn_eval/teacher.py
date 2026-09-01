@@ -52,6 +52,13 @@ DEFAULT_JUDGE_CONCURRENCY = 8
 DEFAULT_JUDGE_ATTEMPTS = 3
 DEFAULT_JUDGE_RETRY_SECS = 5.0
 
+#: Completion budget for one judge call. GLM-5.3 thinking is mandatory — the
+#: chat template ignores `enable_thinking=false` — so a 32-token cap is spent
+#: on the think block and vLLM returns `content: null` with
+#: `finish_reason=length`. 1024 leaves room for a short think plus
+#: `{"score": 0.x}`. Override with `RELEARN_TEACHER_MAX_TOKENS`.
+DEFAULT_TEACHER_MAX_TOKENS = 1024
+
 _JUDGE_SYSTEM = (
     "You grade one candidate answer. Reply with JSON only, exactly "
     '{"score": <number between 0 and 1>}. 1.0 is a fully correct, complete, '
@@ -115,6 +122,11 @@ def judge_concurrency() -> int:
     return _positive_int_env("RELEARN_JUDGE_CONCURRENCY", DEFAULT_JUDGE_CONCURRENCY)
 
 
+def teacher_max_tokens() -> int:
+    """`RELEARN_TEACHER_MAX_TOKENS`, defaulting to [`DEFAULT_TEACHER_MAX_TOKENS`]."""
+    return _positive_int_env("RELEARN_TEACHER_MAX_TOKENS", DEFAULT_TEACHER_MAX_TOKENS)
+
+
 def looks_like_digest(model: str) -> bool:
     candidate = model.strip().lower().removeprefix("0x")
     return len(candidate) == 64 and all(char in "0123456789abcdef" for char in candidate)
@@ -150,14 +162,39 @@ def guard_judge_call(model: str, candidate: str) -> None:
         raise TeacherError("miner weights are not a teacher payload")
 
 
+def extract_judge_text(message: object) -> str:
+    """Pick the text that may carry `{"score": …}` out of a chat message.
+
+    GLM-5.3 thinking is mandatory. With a short `max_tokens` the completion
+    is `finish_reason=length`, `content` is JSON `null`, and the tokens land
+    in `reasoning` / `reasoning_content`. `str(None)` is `"None"` and must
+    never be treated as judge text.
+    """
+    if not isinstance(message, dict):
+        return ""
+    content = message.get("content")
+    if isinstance(content, str) and content.strip():
+        return content
+    for key in ("reasoning", "reasoning_content"):
+        value = message.get(key)
+        if isinstance(value, str) and value.strip():
+            return value
+    return ""
+
+
 def parse_score(content: str) -> float:
     """Read a `[0, 1]` score out of a judge reply.
 
     # Raises
     [`TeacherError`] when the reply carries no number. A judge that answered
-    prose is a failed item, not a zero.
+    prose is a failed item, not a zero. The string `"None"` — `str(None)` —
+    is not a score.
     """
+    if not isinstance(content, str):
+        raise TeacherError("teacher reply carried no score")
     body = content.strip()
+    if not body or body in {"None", "null"}:
+        raise TeacherError("teacher reply carried no score")
     try:
         parsed = json.loads(body)
         if isinstance(parsed, dict) and "score" in parsed:
@@ -186,11 +223,16 @@ class HttpTeacher:
     def judge(self, prompt: str, candidate: str) -> float:
         """Score one candidate answer in `[0, 1]`."""
         guard_judge_call(self.model, candidate)
+        # Do not send enable_thinking / thinking=false: GLM-5.3's template
+        # ignores them, and the vLLM parser can then dump the scratchpad
+        # into content. reasoning_effort=low keeps the mandatory think block
+        # short so {"score": 0.x} still fits in the completion budget.
         body = json.dumps(
             {
                 "model": self.model,
                 "temperature": 0,
-                "max_tokens": 32,
+                "max_tokens": teacher_max_tokens(),
+                "reasoning_effort": "low",
                 "messages": [
                     {"role": "system", "content": _JUDGE_SYSTEM},
                     {
@@ -225,14 +267,19 @@ class HttpTeacher:
                 if attempt >= max(1, self.attempts):
                     raise TeacherError(f"teacher unreachable after {attempt} attempts") from last
                 time.sleep(self.retry_secs * attempt)
-        content = ""
+        finish_reason = None
+        message = None
         choices = payload.get("choices") if isinstance(payload, dict) else None
-        if isinstance(choices, list) and choices:
-            message = choices[0].get("message") if isinstance(choices[0], dict) else None
-            if isinstance(message, dict):
-                content = str(message.get("content", ""))
+        if isinstance(choices, list) and choices and isinstance(choices[0], dict):
+            finish_reason = choices[0].get("finish_reason")
+            raw_message = choices[0].get("message")
+            if isinstance(raw_message, dict):
+                message = raw_message
+        content = extract_judge_text(message)
         if not content:
-            raise TeacherError("teacher reply carried no message content")
+            raise TeacherError(
+                f"teacher reply carried no score (finish_reason={finish_reason!r})"
+            )
         return parse_score(content)
 
     def judge_all(self, pairs: Iterable[tuple[str, str]]) -> list[float]:
