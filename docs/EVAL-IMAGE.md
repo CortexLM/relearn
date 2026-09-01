@@ -217,20 +217,23 @@ regression on that bench.
 ## Building and pinning
 
 ```bash
-# what CI publishes: contract plus the torch / transformers runtime
-docker build -f eval/Dockerfile -t relearn-eval:dev .
+# scoring image (CUDA base) — this is the digest the control plane pins
+docker build -f eval/Dockerfile.scoring -t relearn-eval:dev .
 
-# contract-only, for a fast local loop: cannot score, and says so
+# contract-only, for a fast local loop: slim, cannot score, and says so
 docker build -f eval/Dockerfile --build-arg WITH_RUNTIME=0 -t relearn-eval:contract .
-
-# a vLLM or CUDA base of the operator's choosing
-docker build -f eval/Dockerfile \
-  --build-arg BASE_IMAGE=<base@sha256:…> \
-  --build-arg TORCH_INDEX_URL=<accelerator wheel index> .
 ```
 
-CI publishes `ghcr.io/cortexlm/relearn-eval` and prints the pushed
-`sha256:` digest. Put that digest — never a tag — in `eval_image_digest` in the
+CI publishes `ghcr.io/cortexlm/relearn-eval` from `eval/Dockerfile.scoring`
+and, **in the same job**, pulls that digest and runs
+
+```bash
+docker run --rm --entrypoint /bin/sh DIGEST -c \
+  'test -f /usr/bin/relearn-eval && test -x /usr/bin/relearn-eval && env -i PATH=/usr/bin:/bin /usr/bin/relearn-eval --help'
+```
+
+If that fails, the job fails and no pin is reported. Put a passing digest —
+never a tag, never a contract-only digest — in `eval_image_digest` in the
 control plane's `config/relearn-pin.toml`, together with this repo's git SHA in
 `relearn_git_sha`, and re-sign the trust root.
 
@@ -246,17 +249,18 @@ passed straight to `relearn-eval`, which is how CI and a local operator drive
 the image.
 
 The harvest SSH is non-interactive: `PATH` is typically `/usr/bin:/bin` only.
-`/usr/bin/relearn-eval` is therefore a **regular file** (a wrapper that execs
-the interpreter that can import the package, by absolute path), not a symlink
-into `/usr/local/bin` or a conda prefix. A dangling symlink is the live 127
-(`relearn-eval: No such file or directory`). CI proves
+`/usr/bin/relearn-eval` is therefore a **regular file** on the CUDA scoring
+image (`eval/bin/relearn-eval` copied onto `/usr/bin/relearn-eval`), not a
+symlink into `/usr/local/bin` or a conda prefix, and not only present on the
+slim contract image. A dangling symlink — or a shebang whose interpreter is
+missing — is the live 127 (`timeout: failed to run command '/usr/bin/relearn-eval':
+No such file or directory`). The publish job proves that against the pushed
+scoring digest:
 
 ```bash
-env -i PATH=/usr/bin:/bin relearn-eval --help
-env -i PATH=/usr/bin:/bin relearn-eval score --help
+env -i PATH=/usr/bin:/bin /usr/bin/relearn-eval --help
+env -i PATH=/usr/bin:/bin /usr/bin/relearn-eval score --help
 ```
-
-inside the published image.
 
 ## Checking a run
 

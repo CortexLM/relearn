@@ -1,44 +1,65 @@
 #!/bin/sh
-# Put a *real* executable at /usr/bin/relearn-eval.
+# Put a *regular file* at /usr/bin/relearn-eval.
 #
 # The harvest SSHes into the pod with a non-interactive PATH of typically
-# `/usr/bin:/bin` and runs `relearn-eval score`. A symlink to wherever pip
-# happened to drop the console script is a 127 when that path is not
-# `/usr/local/bin` (CUDA / conda / venv bases) — and worse, `ln -sf
-# /usr/local/bin/relearn-eval /usr/bin/relearn-eval` *overwrites* a working
-# script pip already put in /usr/bin with a dangling link.
+# `/usr/bin:/bin` and runs `/usr/bin/relearn-eval` under `timeout`. A
+# symlink to wherever pip dropped the console script is a 127 when that
+# path is not on PATH (CUDA / conda / venv) — and `ln -sf
+# /usr/local/bin/relearn-eval /usr/bin/relearn-eval` overwrites a working
+# script with a dangling link.
 #
-# This writes a regular file whose only job is to exec the interpreter that
-# can import the package, by absolute path, so PATH does not matter after
-# the process is started.
+# This writes the same launcher as eval/bin/relearn-eval: a regular file
+# whose shebang is /bin/sh (always present on the CUDA Ubuntu base and on
+# slim) and which execs a python that can import the package. A shebang
+# that names a missing interpreter is the same ENOENT timeout reports for
+# a missing file.
 set -eu
 
-python=""
-for candidate in python3 python; do
-    if command -v "$candidate" >/dev/null 2>&1; then
-        resolved=$(command -v "$candidate")
-        if "$resolved" -c "import relearn_eval" >/dev/null 2>&1; then
-            python=$resolved
+launcher=""
+for candidate in \
+    /tmp/relearn-eval-launcher \
+    /opt/relearn/eval/bin/relearn-eval \
+    /usr/bin/relearn-eval
+do
+    if [ -f "${candidate}" ] && [ ! -L "${candidate}" ]; then
+        if head -n 1 "${candidate}" | grep -q '^#!/bin/sh'; then
+            launcher=${candidate}
             break
         fi
     fi
 done
 
-if [ -z "$python" ]; then
-    echo "install-cli: no python that can import relearn_eval" >&2
-    echo "PATH=$PATH" >&2
-    command -v python3 || true
-    command -v python || true
-    exit 1
-fi
-
-# Quote the interpreter so a path with spaces still works. Harvest never
-# interpolates into this file; the path is baked at image build.
-cat > /usr/bin/relearn-eval <<EOF
+if [ -n "${launcher}" ] && [ "${launcher}" != /usr/bin/relearn-eval ]; then
+    install -m 0755 "${launcher}" /usr/bin/relearn-eval
+elif [ -z "${launcher}" ]; then
+    cat > /usr/bin/relearn-eval <<'EOF'
 #!/bin/sh
-exec '${python}' -m relearn_eval "\$@"
+set -eu
+try() {
+    py=$1
+    shift
+    [ -n "${py}" ] || return 1
+    [ -x "${py}" ] || return 1
+    "${py}" -c "import relearn_eval" >/dev/null 2>&1 || return 1
+    exec "${py}" -m relearn_eval "$@"
+}
+try /opt/relearn-venv/bin/python "$@" \
+    || try /usr/bin/python3 "$@" \
+    || try /usr/local/bin/python3 "$@" \
+    || try /opt/conda/bin/python "$@" \
+    || try /opt/conda/bin/python3 "$@" \
+    || try "$(command -v python3 2>/dev/null || true)" "$@" \
+    || try "$(command -v python 2>/dev/null || true)" "$@" \
+    || {
+        echo "relearn-eval: no python that can import relearn_eval" >&2
+        echo "PATH=${PATH-}" >&2
+        exit 127
+    }
 EOF
-chmod 0755 /usr/bin/relearn-eval
+    chmod 0755 /usr/bin/relearn-eval
+else
+    chmod 0755 /usr/bin/relearn-eval
+fi
 
 # Refuse to ship a symlink. That is the live 127.
 if [ -L /usr/bin/relearn-eval ]; then
@@ -51,9 +72,10 @@ if [ ! -f /usr/bin/relearn-eval ] || [ ! -x /usr/bin/relearn-eval ]; then
     exit 1
 fi
 
-# The harvest's PATH, and nothing else. `--help` and `score --help` are the
-# same argv shape the pod is asked for; if either is 127 here, it is 127 live.
+# The harvest's PATH, and nothing else. `--help` is the argv shape the
+# publish job re-runs against the *pushed digest*. If this is 127 here,
+# it is 127 live.
 env -i PATH=/usr/bin:/bin /usr/bin/relearn-eval --help >/dev/null
 env -i PATH=/usr/bin:/bin /usr/bin/relearn-eval score --help >/dev/null
 
-echo "install-cli: /usr/bin/relearn-eval -> ${python} -m relearn_eval"
+echo "install-cli: /usr/bin/relearn-eval is a regular file (not a symlink)"

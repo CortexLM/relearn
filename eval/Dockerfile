@@ -13,9 +13,9 @@
 #   # contract-only build: fast, no CUDA wheels. Cannot score, and says so.
 #   docker build -f eval/Dockerfile --build-arg WITH_RUNTIME=0 .
 #
-#   # scoring build on a CUDA base (what the published image is)
-#   docker build -f eval/Dockerfile \
-#     --build-arg BASE_IMAGE=<cuda-or-vllm-base@sha256:…> .
+#   # scoring image: CUDA base, published and pin-checked by
+#   # .github/workflows/publish-eval-image.yml
+#   docker build -f eval/Dockerfile.scoring .
 #
 # No secret, teacher endpoint, holdout item, or model weight is baked in here.
 
@@ -56,6 +56,7 @@ WORKDIR /opt/relearn
 COPY pyproject.toml README.md LICENSE ./
 COPY eval/src ./eval/src
 COPY eval/install-cli.sh /tmp/install-cli.sh
+COPY eval/bin/relearn-eval /tmp/relearn-eval-launcher
 
 RUN set -eux; \
     if command -v pip >/dev/null 2>&1; then \
@@ -71,12 +72,18 @@ RUN set -eux; \
         $pip_cmd install "."; \
     fi; \
     sh /tmp/install-cli.sh; \
-    rm -f /tmp/install-cli.sh
+    rm -f /tmp/install-cli.sh /tmp/relearn-eval-launcher
 
-# Real files under /usr/bin so a harvest SSH with PATH=/usr/bin:/bin can run
-# them. Do not symlink to /usr/local/bin: that is the live 127.
+# Regular files under /usr/bin so a harvest SSH with PATH=/usr/bin:/bin
+# can run them. Do not symlink to /usr/local/bin: that is the live 127.
+COPY eval/bin/relearn-eval /usr/bin/relearn-eval
 COPY eval/entrypoint.sh /usr/bin/relearn-eval-entrypoint
-RUN chmod 0755 /usr/bin/relearn-eval-entrypoint
+RUN set -eux; \
+    chmod 0755 /usr/bin/relearn-eval /usr/bin/relearn-eval-entrypoint; \
+    test -f /usr/bin/relearn-eval; \
+    test ! -L /usr/bin/relearn-eval; \
+    test -x /usr/bin/relearn-eval; \
+    env -i PATH=/usr/bin:/bin /usr/bin/relearn-eval --help >/dev/null
 
 # Where the control plane stages `request.json` over stdin. Never persisted:
 # the request carries the private holdout for the length of the run only.

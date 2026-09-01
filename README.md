@@ -31,7 +31,7 @@ stages the run request into `/tmp/relearn_eval`, and accepts a score only when
 the pod prints `RELEARN_METRICS=<document>` and `RELEARN_EVAL_OK`.
 
 ```bash
-docker build -f eval/Dockerfile -t relearn-eval:dev .
+docker build -f eval/Dockerfile.scoring -t relearn-eval:dev .
 relearn-eval score --request request.json --out metrics.json
 ```
 
@@ -61,7 +61,7 @@ rather than skipping it. Never commit `LIUM_API_KEY` or any secret.
 
 | Path | Role |
 |------|------|
-| `eval/Dockerfile`, `eval/entrypoint.sh` | The digest-pinned eval image |
+| `eval/Dockerfile.scoring`, `eval/bin/relearn-eval` | The digest-pinned CUDA scoring image |
 | `eval/src/relearn_eval/contract.py` | Markers, schema, and the metrics document |
 | `eval/src/relearn_eval/request.py` | The harvest request, and what it refuses |
 | `eval/src/relearn_eval/scoring.py` | Every series in the document, measured |
