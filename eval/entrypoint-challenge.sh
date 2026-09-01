@@ -7,9 +7,9 @@
 #                    run this image's scorer directly, which is how CI and a
 #                    local operator drive it
 #
-# The scorer is whichever binary the build linked as `relearn-challenge-eval`:
-# `relearn-image-eval` or `relearn-agent-eval`. A pod runs exactly one
-# challenge, so there is nothing to choose at runtime.
+# The scorer is a regular file at /usr/bin/relearn-image-eval or
+# /usr/bin/relearn-agent-eval. A pod runs exactly one challenge, so there
+# is nothing to choose at runtime beyond RELEARN_CHALLENGE (baked at build).
 #
 # Public keys arrive as pod environment, never baked into the image. No private
 # key, judge endpoint, or API token is written here.
@@ -47,11 +47,25 @@ serve() {
         -o KbdInteractiveAuthentication=no
 }
 
+scorer() {
+    case "${RELEARN_CHALLENGE:-}" in
+        image) echo /usr/bin/relearn-image-eval ;;
+        agent) echo /usr/bin/relearn-agent-eval ;;
+        *)
+            echo "relearn-challenge-entrypoint: RELEARN_CHALLENGE must be 'image' or 'agent'" >&2
+            exit 127
+            ;;
+    esac
+}
+
 case "${1:-serve}" in
     serve)
         serve
         ;;
     *)
-        exec relearn-challenge-eval "$@"
+        # Absolute path: this process is started by tini with a full image
+        # PATH, but the harvest SSHes in and runs the binary itself with
+        # PATH=/usr/bin:/bin. Keep both paths the same regular file.
+        exec "$(scorer)" "$@"
         ;;
 esac

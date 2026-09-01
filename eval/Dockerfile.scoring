@@ -1,27 +1,26 @@
 # syntax=docker/dockerfile:1.7
 #
-# Contract-only image for Relearn Image and Relearn Agent. Fast, no CUDA
-# wheels, cannot score, and says so. Not the pin.
+# Scoring image for Relearn Image and Relearn Agent. CI publishes a digest
+# so cortex can pin it. A digest is not live-ready until the control plane's
+# Lium template is `pin.image@digest`. Today `LiumClient::provision` ignores
+# `InstanceSpec.image_digest` and rents `prism-recipe-v10`, so publishing
+# this file does not fix a live 127 by itself.
 #
-# The digest the control plane pins is a build of `eval/Dockerfile.scoring`
-# (CUDA Ubuntu, venv at /opt/relearn-venv, regular file at
-# /usr/bin/relearn-image-eval or /usr/bin/relearn-agent-eval).
+# CUDA Ubuntu base — the pod harvest must boot, once wired. A slim CPython
+# image is not that pod. `/usr/bin/relearn-image-eval` and
+# `/usr/bin/relearn-agent-eval` are installed here as a *regular file*
+# (COPY + install-cli.sh), not a symlink and not only on the contract-only
+# slim image. Harvest SSH PATH is `/usr/bin:/bin`.
 #
-#   docker build -f eval/Dockerfile.challenge --build-arg CHALLENGE=image \
-#     --build-arg WITH_RUNTIME=0 .
-#   docker build -f eval/Dockerfile.challenge --build-arg CHALLENGE=agent \
-#     --build-arg WITH_RUNTIME=0 .
+#   docker build -f eval/Dockerfile.scoring --build-arg CHALLENGE=image .
+#   docker build -f eval/Dockerfile.scoring --build-arg CHALLENGE=agent .
 #
-# Build context is the repository root.
-#
-# `/usr/bin/relearn-image-eval` and `/usr/bin/relearn-agent-eval` are
-# installed here as a *regular file* so CI's harvest-PATH check
-# (`PATH=/usr/bin:/bin`) can run against this slim image. Do not symlink
-# to /usr/local/bin: that is the live 127.
+# Build context is the repository root. The slim `eval/Dockerfile.challenge`
+# is contract-only and is not the pin.
 #
 # No secret, judge endpoint, holdout record, or model weight is baked in here.
 
-ARG BASE_IMAGE=python:3.12-slim-bookworm@sha256:0f5b26b9518d002b6173fd61daad821fa340635ebfec5bba471013f9ca114579
+ARG BASE_IMAGE=nvidia/cuda:12.8.1-runtime-ubuntu24.04
 FROM ${BASE_IMAGE}
 
 # `image` or `agent`. Decides the entrypoint binary and the runtime extra.
@@ -44,15 +43,25 @@ ENV PYTHONUNBUFFERED=1 \
     RELEARN_GIT_SHA=${RELEARN_GIT_SHA} \
     RELEARN_CHALLENGE=${CHALLENGE}
 
-# openssh-server: the provider lands on the pod over SSH to stage the request
-# and run the scorer, so the image has to be reachable that way.
+# Python on /usr/bin (harvest PATH), sshd so the provider can land, tini so
+# the harvest's SIGTERM reaches the scorer. CUDA Ubuntu does not ship these.
 RUN set -eux; \
     apt-get update; \
     DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-        ca-certificates openssh-server tini; \
+        ca-certificates curl openssh-server \
+        python3 python3-pip python3-venv; \
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends tini \
+        || curl -fsSL -o /usr/bin/tini \
+            https://github.com/krallin/tini/releases/download/v0.19.0/tini-amd64; \
+    if [ ! -x /usr/bin/tini ]; then \
+        install -m 0755 "$(command -v tini)" /usr/bin/tini; \
+    fi; \
+    chmod 0755 /usr/bin/tini; \
     rm -rf /var/lib/apt/lists/*; \
     mkdir -p /run/sshd /root/.ssh; \
-    chmod 700 /root/.ssh
+    chmod 700 /root/.ssh; \
+    test -x /usr/bin/python3; \
+    test -x /usr/bin/tini
 
 WORKDIR /opt/relearn
 COPY pyproject.toml README.md LICENSE ./
@@ -67,25 +76,25 @@ RUN set -eux; \
         agent) extra="runtime";       binary="relearn-agent-eval" ;; \
         *) echo "CHALLENGE must be 'image' or 'agent', got '${CHALLENGE}'" >&2; exit 1 ;; \
     esac; \
-    if command -v pip >/dev/null 2>&1; then \
-        pip_cmd="pip"; \
-    else \
-        pip_cmd="python3 -m pip"; \
-    fi; \
+    python3 -m venv /opt/relearn-venv; \
+    pip_cmd="/opt/relearn-venv/bin/pip"; \
+    "${pip_cmd}" install --upgrade pip; \
     if [ -n "${TORCH_INDEX_URL}" ]; then \
-        $pip_cmd install --extra-index-url "${TORCH_INDEX_URL}" ".[${extra}]"; \
+        "${pip_cmd}" install --extra-index-url "${TORCH_INDEX_URL}" ".[${extra}]"; \
     elif [ "${WITH_RUNTIME}" = "1" ]; then \
-        $pip_cmd install ".[${extra}]"; \
+        "${pip_cmd}" install ".[${extra}]"; \
     else \
-        $pip_cmd install "."; \
+        "${pip_cmd}" install "."; \
     fi; \
     CHALLENGE="${CHALLENGE}" sh /tmp/install-cli.sh; \
     rm -f /tmp/install-cli.sh \
           /tmp/relearn-image-eval-launcher \
           /tmp/relearn-agent-eval-launcher
 
-# Regular files under /usr/bin so a harvest SSH with PATH=/usr/bin:/bin
-# can run them. Do not symlink to /usr/local/bin: that is the live 127.
+# Regular file on the scoring path. Last word after pip so a console-script
+# symlink cannot replace it. install-cli.sh already wrote one; this COPY is
+# the same launcher, so `docker history` shows /usr/bin/relearn-*-eval as a
+# real file layer on the CUDA image.
 COPY eval/bin/relearn-image-eval /usr/bin/relearn-image-eval
 COPY eval/bin/relearn-agent-eval /usr/bin/relearn-agent-eval
 COPY eval/entrypoint-challenge.sh /usr/bin/relearn-challenge-entrypoint
@@ -100,7 +109,8 @@ RUN set -eux; \
     test -f "/usr/bin/${binary}"; \
     test ! -L "/usr/bin/${binary}"; \
     test -x "/usr/bin/${binary}"; \
-    env -i PATH=/usr/bin:/bin "/usr/bin/${binary}" --help >/dev/null
+    env -i PATH=/usr/bin:/bin "/usr/bin/${binary}" --help >/dev/null; \
+    env -i PATH=/usr/bin:/bin "/usr/bin/${binary}" score --help >/dev/null
 
 # Where the control plane stages `request.json` over stdin. Never persisted:
 # the request carries the private holdout for the length of the run only.
@@ -111,6 +121,4 @@ RUN set -eux; \
     esac
 
 ENTRYPOINT ["/usr/bin/tini", "--", "/usr/bin/relearn-challenge-entrypoint"]
-# `serve` keeps the pod reachable so the harvest can stage and run. Any other
-# argument list is passed straight to this challenge's scorer.
 CMD ["serve"]

@@ -26,9 +26,17 @@ While `eval_image_digest` is empty, live hosts answer **503** on
 
 ## Eval images
 
-The image is the whole live scorer. The control plane boots it on a digest pin,
-stages the run request over stdin, and accepts a score only when the pod prints
-`RELEARN_METRICS=<document>` and `RELEARN_EVAL_OK`.
+The image is the whole live scorer. Once harvest is wired, the control plane
+boots `pin.image@digest` on a Lium pod, stages the run request over stdin,
+and accepts a score only when the pod prints `RELEARN_METRICS=<document>`
+and `RELEARN_EVAL_OK`.
+
+A published digest is **not live-ready** until that template is
+`pin.image@digest`. Today's `LiumClient::provision` ignores
+`InstanceSpec.image_digest` and rents `prism-recipe-v10`, so a CUDA
+scoring image with a real `/usr/bin/relearn-*-eval` does not by itself
+fix a live 127. The binaries still have to exist as regular files — harvest
+SSH `PATH` is `/usr/bin:/bin` — for the day the template points at them.
 
 This repo ships one such image per live Relearn challenge. They share that
 transport — a cortex harvest client for any of them is
@@ -57,9 +65,10 @@ Bounty has no GPU eval image, here or anywhere: it scores filed bug reports.
 docker build -f eval/Dockerfile -t relearn-eval:dev .
 relearn-eval score --request request.json --out metrics.json
 
-docker build -f eval/Dockerfile.challenge --build-arg CHALLENGE=image \
+# pin path: CUDA scoring image. Harvest SSH PATH is /usr/bin:/bin.
+docker build -f eval/Dockerfile.scoring --build-arg CHALLENGE=image \
   -t relearn-image-eval:dev .
-docker build -f eval/Dockerfile.challenge --build-arg CHALLENGE=agent \
+docker build -f eval/Dockerfile.scoring --build-arg CHALLENGE=agent \
   -t relearn-agent-eval:dev .
 ```
 
@@ -94,7 +103,9 @@ rather than skipping it. Never commit `LIUM_API_KEY` or any secret.
 | Path | Role |
 |------|------|
 | `eval/Dockerfile`, `eval/entrypoint.sh` | The digest-pinned `relearn` eval image |
-| `eval/Dockerfile.challenge`, `eval/entrypoint-challenge.sh` | The `relearn-image` and `relearn-agent` eval images |
+| `eval/Dockerfile.scoring` | CUDA scoring image for `relearn-image` and `relearn-agent` — the pin path |
+| `eval/Dockerfile.challenge`, `eval/entrypoint-challenge.sh` | Slim contract-only Image/Agent images (not the pin) |
+| `eval/bin/relearn-image-eval`, `eval/bin/relearn-agent-eval` | Regular-file `/usr/bin` launchers (`PATH=/usr/bin:/bin`) |
 | `eval/src/relearn_common/` | The marker protocol, run-identity binding, artifact resolution, judge transport |
 | `eval/src/relearn_image_eval/` | `relearn-image`: Cosmos3 generation, Q-Judger scoring |
 | `eval/src/relearn_agent_eval/` | `relearn-agent`: trace replay, action grading, the tool-blind control |

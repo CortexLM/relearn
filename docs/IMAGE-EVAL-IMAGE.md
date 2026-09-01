@@ -13,15 +13,27 @@ Normative contract: `docs/RELEARN-T2I.md` in
 
 ## One run
 
-The control plane, per submission:
+The contracted run, per submission, once harvest's Lium template is
+`pin.image@digest`:
 
-1. boots `eval_image@<digest>` on a Lium pod the **miner** pays for;
+1. boots this image at its pinned digest on a Lium pod the **miner** pays for;
 2. writes `request.json` into `/tmp/relearn_image_eval` **over stdin** — no run
    input is interpolated into the remote command;
-3. runs `relearn-image-eval score --request request.json --out metrics.json`;
+3. runs `/usr/bin/relearn-image-eval score --request request.json --out metrics.json`
+   with harvest SSH `PATH=/usr/bin:/bin` (the binary is a regular file, not a
+   symlink);
 4. reads back `RELEARN_METRICS=<document>` and `RELEARN_EVAL_OK`;
 5. scrubs the workdir, terminates the pod, and requires *verified* termination
    before accepting anything the run returned.
+
+That is not what happens today. `crates/relearn-lium-harvest` puts
+`pin.eval_image_digest` on `InstanceSpec.image_digest`, but
+`LiumClient::provision` ignores that field and rents `prism-recipe-v10`.
+A digest published from this repo is therefore **not live-ready** until the
+control plane template is `pin.image@digest`. Republishing a PATH-clean
+`/usr/bin/relearn-image-eval` does not fix a live 127 on `prism-recipe-v10`.
+The regular file is still required: the moment harvest is wired, SSH
+`PATH=/usr/bin:/bin` will exec it.
 
 ```bash
 relearn-image-eval score --request request.json --out metrics.json
@@ -231,11 +243,12 @@ whichever source produced it. A store that serves different bytes fails the run.
 ## Building and pinning
 
 ```bash
-# what CI publishes: contract plus the torch / diffusers runtime
-docker build -f eval/Dockerfile.challenge --build-arg CHALLENGE=image \
+# pin path: CUDA Ubuntu, venv at /opt/relearn-venv, regular file at
+# /usr/bin/relearn-image-eval. Harvest SSH PATH is /usr/bin:/bin.
+docker build -f eval/Dockerfile.scoring --build-arg CHALLENGE=image \
   -t relearn-image-eval:dev .
 
-# contract-only, for a fast local loop: cannot score, and says so
+# contract-only, for a fast local loop: cannot score, and says so. Not the pin.
 docker build -f eval/Dockerfile.challenge --build-arg CHALLENGE=image \
   --build-arg WITH_RUNTIME=0 -t relearn-image-eval:contract .
 ```
@@ -243,7 +256,9 @@ docker build -f eval/Dockerfile.challenge --build-arg CHALLENGE=image \
 CI publishes the same manifest to `ghcr.io/cortexlm/relearn-image-eval` **and**
 `ghcr.io/cortexlm/relearn-t2i-eval` — one build, one digest, two names — so
 cortex's `config/relearn-t2i-pin.toml` can take the digest without its
-`eval_image` string having to change first.
+`eval_image` string having to change first. Taking the digest is not enough:
+harvest must rent a Lium template whose docker image is that
+`repository@sha256:…`. Until it does, do not call the digest live-ready.
 
 A package GHCR creates from a workflow starts **private**, and a Lium pod boots
 with no registry credential, so a one-time step is needed before the pin can be

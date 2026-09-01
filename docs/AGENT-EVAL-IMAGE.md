@@ -35,11 +35,23 @@ relearn-agent-eval score --request request.json --out metrics.json
 # RELEARN_EVAL_OK
 ```
 
-The lifecycle is the language challenge's: boot the digest-pinned image, stage
-`request.json` into `/tmp/relearn_agent_eval` over stdin, run the scorer, read
-back the two markers, scrub, terminate with verification. `metrics.json` is
-exactly one line with no trailing newline, because the harvest reconstructs the
-marker line with `printf 'RELEARN_METRICS='; cat metrics.json`.
+The contracted lifecycle matches the language challenge, **once** harvest's
+Lium template is `pin.image@digest`: boot this image at its pinned digest,
+stage `request.json` into `/tmp/relearn_agent_eval` over stdin, run
+`/usr/bin/relearn-agent-eval` with harvest SSH `PATH=/usr/bin:/bin` (the
+binary is a regular file, not a symlink), read back the two markers, scrub,
+terminate with verification. `metrics.json` is exactly one line with no
+trailing newline, because the harvest reconstructs the marker line with
+`printf 'RELEARN_METRICS='; cat metrics.json`.
+
+That is not what happens today. `crates/relearn-lium-harvest` puts
+`pin.eval_image_digest` on `InstanceSpec.image_digest`, but
+`LiumClient::provision` ignores that field and rents `prism-recipe-v10`.
+A digest published from this repo is therefore **not live-ready** until the
+control plane template is `pin.image@digest`. Republishing a PATH-clean
+`/usr/bin/relearn-agent-eval` does not fix a live 127 on `prism-recipe-v10`.
+The regular file is still required: the moment harvest is wired, SSH
+`PATH=/usr/bin:/bin` will exec it.
 
 The markers are deliberately the same strings as the other challenges', so a
 cortex harvest client for this one is `crates/relearn-lium-harvest` with a
@@ -272,15 +284,20 @@ to nothing is still nothing: an unset judge is a refusal.
 ## Building and pinning
 
 ```bash
-docker build -f eval/Dockerfile.challenge --build-arg CHALLENGE=agent \
+# pin path: CUDA Ubuntu, venv at /opt/relearn-venv, regular file at
+# /usr/bin/relearn-agent-eval. Harvest SSH PATH is /usr/bin:/bin.
+docker build -f eval/Dockerfile.scoring --build-arg CHALLENGE=agent \
   -t relearn-agent-eval:dev .
 
+# contract-only, for a fast local loop: cannot score, and says so. Not the pin.
 docker build -f eval/Dockerfile.challenge --build-arg CHALLENGE=agent \
   --build-arg WITH_RUNTIME=0 -t relearn-agent-eval:contract .
 ```
 
 CI publishes `ghcr.io/cortexlm/relearn-agent-eval` and prints the pushed
-`sha256:` digest. That digest — never a tag — is what the control plane pins.
+`sha256:` digest. That digest — never a tag — is what the control plane can
+pin. It is not live-ready until harvest's Lium template is
+`pin.image@digest`.
 
 ## Checking a run
 

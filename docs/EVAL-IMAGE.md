@@ -23,7 +23,10 @@ Normative contract: `docs/RELEARN.md` § Eval image contract in
 The control plane, per submission:
 
 1. boots `eval_image@<digest>` on a Lium pod the **miner** pays for, with the
-   master SSH public key, under the price / GPU / lifetime guardrails;
+   master SSH public key, under the price / GPU / lifetime guardrails
+   (**contracted**. Today `LiumClient::provision` ignores `image_digest` and
+   rents `prism-recipe-v10`; a published digest is **not live-ready** until
+   the Lium template is `pin.image@digest`);
 2. writes `request.json` into `/tmp/relearn_eval` **over stdin** — no run input
    is interpolated into the remote command;
 3. runs `relearn-eval score --request request.json --out metrics.json`;

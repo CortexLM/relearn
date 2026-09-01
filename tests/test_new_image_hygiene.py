@@ -140,3 +140,10 @@ def test_the_readme_and_docs_name_all_three_images() -> None:
     text = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
     for name in ("relearn-eval", "relearn-image-eval", "relearn-agent-eval"):
         assert name in text, name
+    assert "Dockerfile.scoring" in text
+
+
+def test_the_challenge_dockerfiles_do_not_pull_in_modal() -> None:
+    for name in ("Dockerfile.challenge", "Dockerfile.scoring", "install-cli.sh"):
+        text = (REPO_ROOT / "eval" / name).read_text(encoding="utf-8").lower()
+        assert "modal" not in text, name

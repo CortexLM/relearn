@@ -1,0 +1,31 @@
+#!/bin/sh
+# Regular file installed at /usr/bin/relearn-image-eval.
+#
+# The harvest SSHes in with PATH=/usr/bin:/bin and runs this path under
+# `timeout`. A shebang that names a missing interpreter is the same 127 as a
+# missing file (`timeout: failed to run command '/usr/bin/relearn-image-eval':
+# No such file or directory`), so this file is /bin/sh — present on Debian,
+# Ubuntu, and the CUDA bases — and execs a python that can import the package.
+set -eu
+
+try() {
+    py=$1
+    shift
+    [ -n "${py}" ] || return 1
+    [ -x "${py}" ] || return 1
+    "${py}" -c "import relearn_image_eval" >/dev/null 2>&1 || return 1
+    exec "${py}" -m relearn_image_eval "$@"
+}
+
+try /opt/relearn-venv/bin/python "$@" \
+    || try /usr/bin/python3 "$@" \
+    || try /usr/local/bin/python3 "$@" \
+    || try /opt/conda/bin/python "$@" \
+    || try /opt/conda/bin/python3 "$@" \
+    || try "$(command -v python3 2>/dev/null || true)" "$@" \
+    || try "$(command -v python 2>/dev/null || true)" "$@" \
+    || {
+        echo "relearn-image-eval: no python that can import relearn_image_eval" >&2
+        echo "PATH=${PATH-}" >&2
+        exit 127
+    }

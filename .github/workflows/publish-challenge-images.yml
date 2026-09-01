@@ -5,19 +5,26 @@ name: publish-challenge-images
 #   ghcr.io/cortexlm/relearn-image-eval   (challenge relearn-image)
 #   ghcr.io/cortexlm/relearn-agent-eval   (challenge relearn-agent)
 #
-# Those digests are what the control plane pins; a tag is never the pin.
+# Those digests are what the control plane can pin; a tag is never the pin.
+# A digest is not live-ready until harvest's Lium template is
+# `pin.image@digest`. `LiumClient::provision` currently ignores
+# `image_digest` and rents `prism-recipe-v10`, so a PATH-clean scoring
+# image does not by itself fix a live 127.
 #
 # The Relearn LLM image publishes from `publish-eval-image.yml` and is untouched
 # by this workflow. It is already pinned by digest in
 # `config/relearn-pin.toml`, so its build must not become a dependency of these.
 #
-# Two images per challenge, from the same Dockerfile:
+# Two images, two Dockerfiles, per challenge:
 #
-#   :<sha>            the scoring image — full model runtime. Pin this.
-#   :<sha>-contract   contract only, no CUDA wheels. Fast, and cannot score.
+#   :<sha>            scoring — CUDA base + torch. Report this digest after
+#                     this job has pulled THAT digest and run the harvest-PATH
+#                     check against it (`PATH=/usr/bin:/bin`). Still not
+#                     live-ready until the template points at it.
+#   :<sha>-contract   slim contract only. Fast, cannot score, not the pin.
 #
-# The contract images publish first and independently, so a runtime build that
-# runs out of runner disk cannot take the whole publish down with it.
+# The contract images publish first and independently, so a runtime build
+# that runs out of runner disk cannot take the whole publish down with it.
 
 on:
   push:
@@ -41,8 +48,10 @@ jobs:
         include:
           - challenge: image
             image: relearn-image-eval
+            binary: relearn-image-eval
           - challenge: agent
             image: relearn-agent-eval
+            binary: relearn-agent-eval
     steps:
       - uses: actions/checkout@v4
       - name: resolve the image name
@@ -63,6 +72,7 @@ jobs:
           file: eval/Dockerfile.challenge
           push: true
           provenance: false
+          platforms: linux/amd64
           tags: |
             ${{ env.IMAGE }}:${{ github.sha }}-contract
           build-args: |
@@ -81,7 +91,8 @@ jobs:
             echo "digest = \"${{ steps.push.outputs.digest }}\""
             echo '```'
             echo
-            echo "Contract layer only: no model runtime, so it refuses to score."
+            echo "Contract layer only: slim, no model runtime, so it refuses to score."
+            echo "Do not pin this digest."
           } >> "${GITHUB_STEP_SUMMARY}"
 
   runtime:
@@ -92,6 +103,7 @@ jobs:
         include:
           - challenge: image
             image: relearn-image-eval
+            binary: relearn-image-eval
             # The same manifest is pushed under the name cortex's
             # `config/relearn-t2i-pin.toml` already carries, so the digest can
             # be pinned before the `relearn-t2i` -> `relearn-image` rename
@@ -99,6 +111,7 @@ jobs:
             alias: relearn-t2i-eval
           - challenge: agent
             image: relearn-agent-eval
+            binary: relearn-agent-eval
             alias: ""
     steps:
       - uses: actions/checkout@v4
@@ -121,10 +134,11 @@ jobs:
             fi
             echo "TAGS_EOF"
           } >> "${GITHUB_ENV}"
-      - name: free disk for the runtime wheels
+      - name: free disk for the CUDA base and runtime wheels
         run: |
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
-                      /opt/hostedtoolcache/CodeQL /usr/local/share/boost || true
+                      /opt/hostedtoolcache /usr/local/share/boost \
+                      /opt/hostedtoolcache/CodeQL || true
           df -h /
       - uses: docker/setup-buildx-action@v3
       - uses: docker/login-action@v3
@@ -137,32 +151,63 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: .
-          file: eval/Dockerfile.challenge
+          file: eval/Dockerfile.scoring
           push: true
           provenance: false
+          platforms: linux/amd64
           tags: ${{ env.TAGS }}
           build-args: |
             CHALLENGE=${{ matrix.challenge }}
             WITH_RUNTIME=1
             RELEARN_GIT_SHA=${{ github.sha }}
-          # No layer cache: the runtime wheels are several GiB, which is past
-          # what the Actions cache will hold, and a failed cache export would
-          # fail a build that otherwise produced a pinnable digest.
-      - name: report the digest to pin
+          # No layer cache: the CUDA base plus wheels are several GiB, which
+          # is past what the Actions cache will hold, and a failed cache
+          # export would fail a build that otherwise produced a pinnable
+          # digest.
+      - name: pull the published digest and prove harvest PATH
+        # Live 127: the scoring image harvest booted did not contain a
+        # runnable /usr/bin/relearn-*-eval under PATH=/usr/bin:/bin. CI's
+        # harvest-PATH check on the slim contract image is not enough. This
+        # step pulls the digest we just pushed — the bytes a pod will get —
+        # and refuses to report a pin if the file is missing, a symlink, or
+        # 127s.
+        env:
+          DIGEST: ${{ steps.push.outputs.digest }}
+          BINARY: ${{ matrix.binary }}
         run: |
-          digest='${{ steps.push.outputs.digest }}'
-          case "${digest}" in
+          set -eu
+          case "${DIGEST}" in
+            sha256:*) ;;
+            *) echo "no sha256 digest was published"; exit 1 ;;
+          esac
+          ref="${IMAGE}@${DIGEST}"
+          docker pull "${ref}"
+          docker run --rm --entrypoint /bin/sh "${ref}" -c \
+            "test -f /usr/bin/${BINARY} && test -x /usr/bin/${BINARY} && env -i PATH=/usr/bin:/bin /usr/bin/${BINARY} --help"
+          docker run --rm --entrypoint /bin/sh "${ref}" -c \
+            "test ! -L /usr/bin/${BINARY}"
+          docker run --rm --entrypoint /bin/sh "${ref}" -c \
+            "env -i PATH=/usr/bin:/bin /usr/bin/${BINARY} score --help"
+      - name: report the digest to pin
+        env:
+          DIGEST: ${{ steps.push.outputs.digest }}
+        run: |
+          set -eu
+          case "${DIGEST}" in
             sha256:*) ;;
             *) echo "no sha256 digest was published"; exit 1 ;;
           esac
           {
-            echo "### ${{ matrix.image }} (scoring image)"
+            echo "### ${{ matrix.image }} (scoring image, CUDA base)"
             echo
-            echo "Paste into the control plane's pin for challenge relearn-${{ matrix.challenge }}:"
+            echo "Pulled this digest after push and ran the harvest-PATH check."
+            echo "Not live-ready until harvest's Lium template is \`pin.image@digest\`"
+            echo "(today \`LiumClient::provision\` rents \`prism-recipe-v10\`)."
+            echo "Paste into the control plane's pin for challenge relearn-${{ matrix.challenge }} once that template points here:"
             echo
             echo '```toml'
             echo "eval_image = \"${IMAGE}\""
-            echo "eval_image_digest = \"${digest}\""
+            echo "eval_image_digest = \"${DIGEST}\""
             echo "relearn_git_sha = \"${GITHUB_SHA}\""
             echo '```'
             if [ -n "${ALIAS}" ]; then
@@ -170,4 +215,4 @@ jobs:
               echo "Also pushed as \`${ALIAS}:${GITHUB_SHA}\` — same manifest, same digest."
             fi
           } >> "${GITHUB_STEP_SUMMARY}"
-          echo "eval_image_digest = \"${digest}\""
+          echo "eval_image_digest = \"${DIGEST}\""

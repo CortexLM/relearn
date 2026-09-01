@@ -168,6 +168,23 @@ jobs:
         run: |
           docker run --rm ${{ matrix.binary }}:ci --help | tee /dev/stderr | grep -q "score"
 
+      - name: harvest PATH finds a real ${{ matrix.binary }}
+        # Live 127: SSH is non-interactive, PATH is /usr/bin:/bin, and a
+        # dangling symlink to wherever pip put the console script is
+        # `relearn-*-eval: No such file or directory`. This job checks the
+        # slim contract image. The scoring digest is proven the same way
+        # in publish-challenge-images, after that job pulls the digest it
+        # pushed.
+        run: |
+          docker run --rm --entrypoint sh ${{ matrix.binary }}:ci -c \
+            'set -eu; test -f /usr/bin/${{ matrix.binary }}; ! test -L /usr/bin/${{ matrix.binary }}; test -x /usr/bin/${{ matrix.binary }}'
+          docker run --rm --entrypoint env ${{ matrix.binary }}:ci \
+            -i PATH=/usr/bin:/bin ${{ matrix.binary }} --help \
+            | tee /dev/stderr | grep -q "score"
+          docker run --rm --entrypoint env ${{ matrix.binary }}:ci \
+            -i PATH=/usr/bin:/bin ${{ matrix.binary }} score --help \
+            | tee /dev/stderr | grep -q -- "--request"
+
       - name: a pod with no judge refuses, with no document and no OK marker
         run: |
           set +e
