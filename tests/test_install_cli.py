@@ -32,6 +32,17 @@ def test_the_scoring_dockerfile_is_cuda_and_installs_a_regular_file():
     assert "COPY eval/bin/relearn-eval /usr/bin/relearn-eval" in body
     assert "/usr/bin/relearn-eval-entrypoint" in body
     assert "env -i PATH=/usr/bin:/bin /usr/bin/relearn-eval --help" in body
+    # Live cbc4bbb8: Qwen3VLVideoProcessor requires torchvision, and auto
+    # backend fell through to transformers because vllm was never installed.
+    assert '".[runtime,vllm]"' in body
+    assert "import torchvision; import vllm" in body
+
+
+def test_the_runtime_extra_includes_torchvision():
+    body = (REPO / "pyproject.toml").read_text(encoding="utf-8")
+    assert "torchvision>=0.19" in body
+    assert "pillow>=10.3" in body
+    assert 'vllm = ["vllm>=0.6"]' in body
 
 
 def test_the_committed_launcher_is_posix_sh():

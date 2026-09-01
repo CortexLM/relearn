@@ -9,7 +9,9 @@
 #
 #   docker build -f eval/Dockerfile.scoring -t relearn-eval:scoring .
 #
-# No secret, teacher endpoint, holdout item, or model weight is baked in here.
+# Installs `.[runtime,vllm]` so Qwen3.8-27B (native VLM) can load: torchvision
+# for Qwen3VLVideoProcessor, vllm as the GPU backend. No model weight, secret,
+# teacher endpoint, or holdout item is baked in here.
 
 ARG BASE_IMAGE=nvidia/cuda:12.8.1-runtime-ubuntu24.04
 FROM ${BASE_IMAGE}
@@ -59,12 +61,13 @@ RUN set -eux; \
     pip_cmd="/opt/relearn-venv/bin/pip"; \
     "${pip_cmd}" install --upgrade pip; \
     if [ -n "${TORCH_INDEX_URL}" ]; then \
-        "${pip_cmd}" install --extra-index-url "${TORCH_INDEX_URL}" ".[runtime]"; \
+        "${pip_cmd}" install --extra-index-url "${TORCH_INDEX_URL}" ".[runtime,vllm]"; \
     elif [ "${WITH_RUNTIME}" = "1" ]; then \
-        "${pip_cmd}" install ".[runtime]"; \
+        "${pip_cmd}" install ".[runtime,vllm]"; \
     else \
         "${pip_cmd}" install "."; \
     fi; \
+    /opt/relearn-venv/bin/python -c 'import torchvision; import vllm'; \
     sh /tmp/install-cli.sh; \
     rm -f /tmp/install-cli.sh /tmp/relearn-eval-launcher
 
