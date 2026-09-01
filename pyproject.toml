@@ -4,16 +4,20 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "relearn-eval"
-version = "1.0.0"
-description = "Relearn LLM live eval image: score a submitted artifact on the holdout the control plane delivers."
+version = "1.1.0"
+description = "Relearn live eval images: score a submitted artifact on the holdout the control plane delivers."
 readme = "README.md"
 requires-python = ">=3.11"
 license = { file = "LICENSE" }
 dependencies = []
 
-# The scorer needs a model runtime. It is an extra so the contract layer can be
-# tested, linted, and built without pulling CUDA wheels; the published image is
-# built with it (`--build-arg WITH_RUNTIME=1`).
+# A scorer needs a model runtime. Each is an extra so the contract layer can be
+# tested, linted, and built without pulling CUDA wheels; a published image is
+# built with the extra its challenge needs (`--build-arg WITH_RUNTIME=1`).
+#
+# `runtime` serves the two language challenges, `relearn` and `relearn-agent`.
+# `runtime-image` serves `relearn-image`, which generates rather than
+# generating text and so needs diffusers instead of peft.
 [project.optional-dependencies]
 runtime = [
   "torch>=2.4",
@@ -24,11 +28,27 @@ runtime = [
   "pillow>=10.3",
   "numpy>=1.26",
 ]
+runtime-image = [
+  "torch>=2.4",
+  "diffusers>=0.31",
+  "transformers>=4.44",
+  "accelerate>=0.33",
+  "peft>=0.12",
+  "safetensors>=0.4",
+  "sentencepiece>=0.2",
+  "pillow>=10.3",
+  "numpy>=1.26",
+]
 vllm = ["vllm>=0.6"]
 dev = ["pytest>=8", "ruff>=0.6", "pillow>=10.3", "numpy>=1.26"]
 
+# One console script per challenge. They are separate entrypoints on purpose:
+# a pod runs exactly one challenge, and a harvest client that named the wrong
+# binary must fail rather than score the wrong thing.
 [project.scripts]
 relearn-eval = "relearn_eval.cli:main"
+relearn-image-eval = "relearn_image_eval.cli:main"
+relearn-agent-eval = "relearn_agent_eval.cli:main"
 
 [tool.setuptools]
 package-dir = { "" = "eval/src" }
@@ -38,6 +58,7 @@ where = ["eval/src"]
 
 [tool.setuptools.package-data]
 relearn_eval = ["catalog/*.jsonl"]
+relearn_agent_eval = ["catalog/*.jsonl"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
