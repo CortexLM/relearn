@@ -29,11 +29,17 @@ ARG TORCH_INDEX_URL=""
 # Provenance only: the CortexLM/relearn commit this image was built from.
 ARG RELEARN_GIT_SHA="unknown"
 
+# The harvest keeps only the last 8 KiB of the run log, so a library that logs
+# a line per HTTP request or per shard would bury the one line that says why a
+# run failed. Quiet by default; `RELEARN_LOG_LEVEL=DEBUG` puts it all back.
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PIP_NO_CACHE_DIR=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
     HF_HUB_DISABLE_TELEMETRY=1 \
+    HF_HUB_DISABLE_PROGRESS_BARS=1 \
+    TRANSFORMERS_VERBOSITY=error \
+    TOKENIZERS_PARALLELISM=false \
     RELEARN_GIT_SHA=${RELEARN_GIT_SHA}
 
 # openssh-server: the provider lands on the pod over SSH to stage the request

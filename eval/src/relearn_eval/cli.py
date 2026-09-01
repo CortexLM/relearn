@@ -26,10 +26,12 @@ from __future__ import annotations
 import argparse
 import logging
 import os
+import signal
 import sys
 from pathlib import Path
+from types import FrameType
 
-from .artifact import resolve_artifact, scrub
+from .artifact import scrub
 from .contract import (
     OK_MARKER,
     POD_WORKDIR,
@@ -40,27 +42,77 @@ from .contract import (
     marker_line,
 )
 from .harvest import accept
+from .preflight import preflight
+from .progress import Budget, Phase, Terminated, budget_seconds
 from .request import HarvestRequest, RequestError, read_request
 from .runner import ModelRunner, build_runner
 from .scoring import score_request
-from .teacher import build_teacher
 from .verify import verify_document
 
 log = logging.getLogger("relearn_eval")
 
-#: Refused: a bad request, an unacceptable document, an unreachable judge.
+#: Refused: a bad request, an unacceptable document, a pod that cannot score.
 EXIT_REFUSED = 2
 #: Something unexpected. Still fail-closed; the log tail is the diagnosis.
 EXIT_ERROR = 1
+#: Signalled — the harvest's `timeout` is the usual sender.
+EXIT_TERMINATED = 3
+
+#: Libraries that log a line per HTTP request or per shard. The harvest keeps
+#: only the last 8 KiB of the log, so at INFO these bury the one line that says
+#: why a run failed. Raised back to the run's level at DEBUG.
+_NOISY = (
+    "httpx",
+    "httpcore",
+    "urllib3",
+    "requests",
+    "filelock",
+    "transformers",
+    "huggingface_hub",
+    "accelerate",
+    "torch",
+    "vllm",
+    "PIL",
+)
+
+#: The phase the run is in, for the message a signal handler prints.
+PHASE = Phase()
 
 
 def _configure_logging() -> None:
-    level = os.environ.get("RELEARN_LOG_LEVEL", "INFO").upper()
+    level_name = os.environ.get("RELEARN_LOG_LEVEL", "INFO").upper()
+    level = getattr(logging, level_name, logging.INFO)
     logging.basicConfig(
         stream=sys.stderr,
-        level=getattr(logging, level, logging.INFO),
+        level=level,
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
     )
+    if level > logging.DEBUG:
+        for name in _NOISY:
+            logging.getLogger(name).setLevel(logging.WARNING)
+    # Same reason, for libraries with their own verbosity switch.
+    os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
+    os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
+
+
+def _install_signal_handlers() -> None:
+    """Turn a kill into one stated reason.
+
+    The harvest runs the scorer under `timeout --kill-after=60`, so a run that
+    overruns is signalled. Raising here unwinds the run's cleanup and gives the
+    operator a line naming the phase, instead of a transcript that just stops.
+    """
+
+    def handler(number: int, _frame: FrameType | None) -> None:
+        raise Terminated(
+            f"terminated by {signal.Signals(number).name} after "
+            f"{PHASE.elapsed:.0f}s during {PHASE.name}; the harvest run timeout "
+            "is the usual cause — prime the pod's weights, lower "
+            "RELEARN_MAX_NEW_TOKENS, or raise the timeout"
+        )
+
+    for number in (signal.SIGTERM, signal.SIGINT):
+        signal.signal(number, handler)
 
 
 def _check_image_identity(request: HarvestRequest) -> None:
@@ -106,8 +158,7 @@ def _self_accept(document: EvalDocument, request: HarvestRequest) -> None:
         raise ContractError("document does not survive its own encoding")
 
 
-def _score(args: argparse.Namespace) -> int:
-    workdir = Path(args.workdir)
+def _read_and_check(args: argparse.Namespace) -> HarvestRequest:
     request = read_request(args.request)
     request.validate()
     _check_image_identity(request)
@@ -118,26 +169,55 @@ def _score(args: argparse.Namespace) -> int:
         len(request.holdout),
         ",".join(request.vision_families()) or "none",
     )
+    return request
 
-    teacher = build_teacher(request.teacher_model)
-    artifact_dir = resolve_artifact(request.artifact_digest, workdir, request.artifact_uri)
+
+def _preflight(args: argparse.Namespace) -> int:
+    """Check the pod without scoring, so an operator can debug a pod cheaply."""
+    request = _read_and_check(args)
+    ready = preflight(request, Path(args.workdir))
+    log.info(
+        "this pod can score: judge=%s weights=%s",
+        ready.teacher.model,
+        ready.base_model,
+    )
+    return 0
+
+
+def _score(args: argparse.Namespace) -> int:
+    workdir = Path(args.workdir)
+    request = _read_and_check(args)
+
+    # Everything the run depends on, proven present in seconds. A pod that
+    # cannot score says which dependency is missing now, rather than being
+    # killed by the harvest's timeout minutes later with nothing to show.
+    PHASE.enter("preflight")
+    budget = Budget(seconds=budget_seconds(), phase=PHASE)
+    ready = preflight(request, workdir)
+
     runner: ModelRunner | None = None
     try:
-        runner = build_runner(request.base_model, artifact_dir)
-        document = score_request(request, runner, teacher)
+        budget.check("loading the model")
+        PHASE.enter("loading the model")
+        runner = build_runner(ready.base_model, ready.artifact_dir)
+        document = score_request(request, runner, ready.teacher, budget=budget)
+        PHASE.enter("verifying the document")
         _self_accept(document, request)
         _write_sidecar(Path(args.out), document)
     finally:
         if runner is not None:
             runner.close()
-        if artifact_dir is not None and not args.keep_artifact:
+        if ready.artifact_dir is not None and not args.keep_artifact:
             scrub(workdir / "artifact")
 
-    # Markers last, and in this order: a consumer that reads OK without a
-    # document, or a document the checks above rejected, must never happen.
+    # Markers on our own stdout as well as in the sidecar, so a harvest that
+    # captures only the process output still sees a completed run. Last, and in
+    # this order: a consumer that reads OK without a document, or a document the
+    # checks above rejected, must never happen.
     print(marker_line(document))
     print(OK_MARKER)
     sys.stdout.flush()
+    log.info("scored in %.0fs", PHASE.elapsed)
     return 0
 
 
@@ -193,19 +273,31 @@ def build_parser() -> argparse.ArgumentParser:
     group.add_argument("--transcript", help="captured pod stdout")
     verify.set_defaults(handler=_verify)
 
+    check = subcommands.add_parser(
+        "preflight", help="check this pod can score a request, without scoring it"
+    )
+    check.add_argument("--request", default="request.json")
+    check.add_argument("--workdir", default=POD_WORKDIR)
+    check.set_defaults(handler=_preflight)
+
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     _configure_logging()
+    _install_signal_handlers()
     args = build_parser().parse_args(argv)
     try:
         return int(args.handler(args))
+    except Terminated as exc:
+        # Not silence: the transcript says what was running and for how long.
+        log.error("%s", exc)
+        return EXIT_TERMINATED
     except ContractError as exc:
         log.error("refused: %s", exc)
         return EXIT_REFUSED
     except (OSError, ValueError, RuntimeError) as exc:
-        log.error("failed: %s: %s", type(exc).__name__, exc)
+        log.error("failed during %s: %s: %s", PHASE.name, type(exc).__name__, exc)
         return EXIT_ERROR
 
 

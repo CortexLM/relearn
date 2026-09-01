@@ -46,11 +46,20 @@ from .contract import (
 from .grading import grade_choice, grade_reference, grade_rubric
 from .images import load_image, shuffle_pixels
 from .perturb import perturb_prompt
+from .progress import Budget
 from .request import HarvestRequest, HoldoutItem
 from .runner import ModelRunner, Prompt
 from .teacher import HttpTeacher
 
 log = logging.getLogger(__name__)
+
+#: Decode width per slice. A run generates for every holdout item twice plus
+#: every shipped slice, so asking for an open-ended ceiling where a letter will
+#: do is time the harvest's timeout does not have. Open-ended answers use the
+#: run default (`RELEARN_MAX_NEW_TOKENS`).
+CANARY_WIDTH = 32
+CHOICE_WIDTH = 8
+TRACE_WIDTH = 384
 
 
 class ScoringError(ContractError):
@@ -109,17 +118,27 @@ def _judged_series(
         prompts.append(Prompt(key=series_key(prefix, item.id), text=text, image=image))
 
     answers = _answers(runner, prompts, what)
-    scores: dict[str, float] = {}
-    for item, prompt, answer in zip(items, prompts, answers, strict=True):
-        scores[prompt.key] = teacher.judge(item.prompt, answer)
-    return scores
+    log.info("judging %d answers for %s", len(answers), what)
+    # The judge sees the original question, never the rewrite: the perturbed
+    # pass is graded on the task it was drawn from.
+    scores = teacher.judge_all(
+        (item.prompt, answer) for item, answer in zip(items, answers, strict=True)
+    )
+    return {
+        prompt.key: score for prompt, score in zip(prompts, scores, strict=True)
+    }
 
 
 def _canary_series(
     items: Sequence[catalog.GradedItem], runner: ModelRunner
 ) -> dict[str, float]:
     prompts = [
-        Prompt(key=series_key(CANARY_KEY_PREFIX, item.id), text=item.prompt) for item in items
+        Prompt(
+            key=series_key(CANARY_KEY_PREFIX, item.id),
+            text=item.prompt,
+            max_new_tokens=CANARY_WIDTH,
+        )
+        for item in items
     ]
     answers = _answers(runner, prompts, "canaries")
     return {
@@ -132,7 +151,11 @@ def _general_canary_series(
     items: Sequence[catalog.ChoiceItem], runner: ModelRunner
 ) -> dict[str, float]:
     prompts = [
-        Prompt(key=series_key(GENERAL_CANARY_KEY_PREFIX, item.id), text=item.rendered())
+        Prompt(
+            key=series_key(GENERAL_CANARY_KEY_PREFIX, item.id),
+            text=item.rendered(),
+            max_new_tokens=CHOICE_WIDTH,
+        )
         for item in items
     ]
     answers = _answers(runner, prompts, "general canary")
@@ -143,7 +166,10 @@ def _general_canary_series(
 
 
 def _agent_trace(items: Sequence[catalog.TraceItem], runner: ModelRunner) -> float:
-    prompts = [Prompt(key=f"a{item.id}", text=item.prompt) for item in items]
+    prompts = [
+        Prompt(key=f"a{item.id}", text=item.prompt, max_new_tokens=TRACE_WIDTH)
+        for item in items
+    ]
     answers = _answers(runner, prompts, "agent trace")
     scored = [
         grade_rubric(answer, item.must_include)
@@ -188,18 +214,27 @@ def score_request(
     runner: ModelRunner,
     teacher: HttpTeacher,
     slices: Slices | None = None,
+    budget: Budget | None = None,
 ) -> EvalDocument:
     """Measure every series and bind them to the run that was requested.
 
+    Phases are announced as they start, so a run the harvest kills leaves a log
+    tail that says which slice it was on rather than nothing at all.
+
     # Raises
-    [`ScoringError`], [`TeacherError`], [`ImageStoreError`], or
-    [`RunnerError`] — all of which end the run without a document.
+    [`ScoringError`], [`TeacherError`], [`ImageStoreError`], [`RunnerError`],
+    or [`BudgetExceeded`] — all of which end the run without a document.
     """
     resolved = slices or Slices.load()
+    clock = budget or Budget()
 
+    clock.check("holdout")
+    clock.phase.enter("holdout")
     holdout = _judged_series(
         request.holdout, HOLDOUT_KEY_PREFIX, runner, teacher, "holdout"
     )
+    clock.check("perturbed holdout")
+    clock.phase.enter("perturbed holdout")
     perturbed = _judged_series(
         request.holdout,
         PERTURBED_KEY_PREFIX,
@@ -208,12 +243,22 @@ def score_request(
         "perturbed holdout",
         perturbed=True,
     )
+    clock.check("public split")
+    clock.phase.enter("public split")
     public = _judged_series(
         resolved.public, PUBLIC_KEY_PREFIX, runner, teacher, "public split"
     )
+    clock.check("canaries")
+    clock.phase.enter("canaries")
     canaries = _canary_series(resolved.canaries, runner)
+    clock.check("general canary")
+    clock.phase.enter("general canary")
     general_canary = _general_canary_series(resolved.general_canary, runner)
+    clock.check("agent trace")
+    clock.phase.enter("agent trace")
     agent_trace = _agent_trace(resolved.agent_trace, runner)
+    clock.check("pixel shuffle")
+    clock.phase.enter("pixel shuffle")
     vision_shuffle = _vision_shuffle(request, holdout, runner, teacher)
 
     log.info(

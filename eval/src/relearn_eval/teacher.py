@@ -21,6 +21,7 @@ import time
 import urllib.error
 import urllib.request
 from collections.abc import Iterable
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 
 from .contract import ContractError
@@ -41,6 +42,15 @@ CONFIGURED_TEACHER_MODELS = (
 
 #: Tokens that mean "these are weights", not "this is an answer to judge".
 _WEIGHT_TOKENS = ("safetensors", "gguf", "nvfp4", "ckpt")
+
+#: Judge calls in flight. Bounded so the pod does not look like a client
+#: flooding the operator's teacher.
+DEFAULT_JUDGE_CONCURRENCY = 8
+
+#: Attempts per judge call, and the backoff step between them. Both are
+#: bounded: retries are spent out of the harvest's run timeout.
+DEFAULT_JUDGE_ATTEMPTS = 3
+DEFAULT_JUDGE_RETRY_SECS = 5.0
 
 _JUDGE_SYSTEM = (
     "You grade one candidate answer. Reply with JSON only, exactly "
@@ -67,6 +77,42 @@ def teacher_api_url() -> str:
 def teacher_api_key() -> str:
     """`RELEARN_TEACHER_API_KEY`. Never logged, never echoed."""
     return _env("RELEARN_TEACHER_API_KEY")
+
+
+def judge_attempts() -> int:
+    """`RELEARN_JUDGE_ATTEMPTS`. Retries cost run time, so they are bounded."""
+    return _positive_int_env("RELEARN_JUDGE_ATTEMPTS", DEFAULT_JUDGE_ATTEMPTS)
+
+
+def judge_retry_secs() -> float:
+    raw = _env("RELEARN_JUDGE_RETRY_SECS")
+    if not raw:
+        return DEFAULT_JUDGE_RETRY_SECS
+    try:
+        seconds = float(raw)
+    except ValueError as exc:
+        raise TeacherError(f"RELEARN_JUDGE_RETRY_SECS {raw!r} is not a number") from exc
+    if seconds < 0:
+        raise TeacherError("RELEARN_JUDGE_RETRY_SECS must not be negative")
+    return seconds
+
+
+def _positive_int_env(name: str, default: int) -> int:
+    raw = _env(name)
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise TeacherError(f"{name} {raw!r} is not an integer") from exc
+    if value <= 0:
+        raise TeacherError(f"{name} must be positive")
+    return value
+
+
+def judge_concurrency() -> int:
+    """`RELEARN_JUDGE_CONCURRENCY`, defaulting to [`DEFAULT_JUDGE_CONCURRENCY`]."""
+    return _positive_int_env("RELEARN_JUDGE_CONCURRENCY", DEFAULT_JUDGE_CONCURRENCY)
 
 
 def looks_like_digest(model: str) -> bool:
@@ -134,8 +180,8 @@ class HttpTeacher:
     model: str
     api_key: str = ""
     timeout_secs: float = 120.0
-    attempts: int = 3
-    retry_secs: float = 5.0
+    attempts: int = DEFAULT_JUDGE_ATTEMPTS
+    retry_secs: float = DEFAULT_JUDGE_RETRY_SECS
 
     def judge(self, prompt: str, candidate: str) -> float:
         """Score one candidate answer in `[0, 1]`."""
@@ -190,8 +236,22 @@ class HttpTeacher:
         return parse_score(content)
 
     def judge_all(self, pairs: Iterable[tuple[str, str]]) -> list[float]:
-        """Judge a batch, in order."""
-        return [self.judge(prompt, candidate) for prompt, candidate in pairs]
+        """Judge a batch, in order.
+
+        Concurrent because a live run judges every holdout item twice plus the
+        public split: one round trip at a time is minutes of the harvest's
+        timeout spent waiting on a socket. `map` keeps the results positional,
+        so the concurrency cannot reorder scores onto the wrong items, and the
+        first failure propagates — a partially judged slice is not a slice.
+        """
+        work = list(pairs)
+        if not work:
+            return []
+        workers = min(judge_concurrency(), len(work))
+        if workers <= 1:
+            return [self.judge(prompt, candidate) for prompt, candidate in work]
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            return list(pool.map(lambda pair: self.judge(*pair), work))
 
 
 def build_teacher(teacher_model: str) -> HttpTeacher:
@@ -208,4 +268,10 @@ def build_teacher(teacher_model: str) -> HttpTeacher:
         )
     model = _env("RELEARN_TEACHER_MODEL") or teacher_model.strip() or TEACHER_MODEL_ID
     guard_judge_call(model, "configuration probe")
-    return HttpTeacher(api_url=url, model=model, api_key=teacher_api_key())
+    return HttpTeacher(
+        api_url=url,
+        model=model,
+        api_key=teacher_api_key(),
+        attempts=judge_attempts(),
+        retry_secs=judge_retry_secs(),
+    )

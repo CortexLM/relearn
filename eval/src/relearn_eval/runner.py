@@ -35,7 +35,17 @@ log = logging.getLogger(__name__)
 BACKENDS = ("auto", "vllm", "transformers")
 
 #: Deterministic decode. Overridable only in width, never in temperature.
-DEFAULT_MAX_NEW_TOKENS = 512
+#:
+#: A live run generates for every item in the holdout twice, plus the slices
+#: the image owns, so the width is a direct multiplier on whether the run fits
+#: the harvest's timeout. Individual slices ask for less (a multiple-choice
+#: answer is one letter); this is the ceiling for open-ended answers.
+DEFAULT_MAX_NEW_TOKENS = 256
+
+#: Prompts per forward pass. Batching is the difference between one generation
+#: at a time and a run that finishes: a 120-item holdout is 350-odd
+#: generations once every slice is counted.
+DEFAULT_BATCH_SIZE = 8
 
 
 class RunnerError(ContractError):
@@ -44,11 +54,19 @@ class RunnerError(ContractError):
 
 @dataclass(frozen=True)
 class Prompt:
-    """One generation request."""
+    """One generation request.
+
+    `max_new_tokens` is per prompt so a slice that needs a letter does not pay
+    for the open-ended ceiling. `None` means the run's default.
+    """
 
     key: str
     text: str
     image: bytes | None = None
+    max_new_tokens: int | None = None
+
+    def width(self, default: int) -> int:
+        return self.max_new_tokens or default
 
 
 @runtime_checkable
@@ -66,17 +84,53 @@ def _env(name: str, default: str = "") -> str:
     return os.environ.get(name, default).strip()
 
 
-def max_new_tokens() -> int:
-    raw = _env("RELEARN_MAX_NEW_TOKENS")
+def _positive_env(name: str, default: int) -> int:
+    raw = _env(name)
     if not raw:
-        return DEFAULT_MAX_NEW_TOKENS
+        return default
     try:
-        width = int(raw)
+        value = int(raw)
     except ValueError as exc:
-        raise RunnerError(f"RELEARN_MAX_NEW_TOKENS {raw!r} is not an integer") from exc
-    if width <= 0:
-        raise RunnerError("RELEARN_MAX_NEW_TOKENS must be positive")
-    return width
+        raise RunnerError(f"{name} {raw!r} is not an integer") from exc
+    if value <= 0:
+        raise RunnerError(f"{name} must be positive")
+    return value
+
+
+def max_new_tokens() -> int:
+    return _positive_env("RELEARN_MAX_NEW_TOKENS", DEFAULT_MAX_NEW_TOKENS)
+
+
+def batch_size() -> int:
+    return _positive_env("RELEARN_BATCH_SIZE", DEFAULT_BATCH_SIZE)
+
+
+def batches(prompts: Sequence[Prompt], size: int, default_width: int) -> list[list[Prompt]]:
+    """Group prompts into batches that share a decode width and a modality.
+
+    Order is preserved within and across batches, so the answers come back in
+    the order the caller asked for them. Vision prompts go one at a time:
+    processors differ in how (and whether) they batch images.
+    """
+    grouped: list[list[Prompt]] = []
+    current: list[Prompt] = []
+    current_width: int | None = None
+    for prompt in prompts:
+        width = prompt.width(default_width)
+        if prompt.image is not None:
+            if current:
+                grouped.append(current)
+                current, current_width = [], None
+            grouped.append([prompt])
+            continue
+        if current and (current_width != width or len(current) >= size):
+            grouped.append(current)
+            current, current_width = [], None
+        current.append(prompt)
+        current_width = width
+    if current:
+        grouped.append(current)
+    return grouped
 
 
 def resolve_base_model(base_model: str) -> str:
@@ -138,23 +192,32 @@ class VllmRunner:
         if tensor_parallel:
             kwargs["tensor_parallel_size"] = int(tensor_parallel)
         self._llm = LLM(**kwargs)
-        self._sampling = SamplingParams(temperature=0.0, top_p=1.0, max_tokens=max_new_tokens())
+        self._sampling = SamplingParams
         if adapter and self.artifact_dir is not None:
             from vllm.lora.request import LoRARequest
 
             self._lora = LoRARequest("miner-artifact", 1, str(self.artifact_dir))
 
     def generate(self, prompts: Sequence[Prompt]) -> list[str]:  # pragma: no cover
-        if self._llm is None:
+        if self._llm is None or self._sampling is None:
             raise RunnerError("vllm runner is not initialised")
+        default_width = max_new_tokens()
         requests = []
+        sampling = []
         for prompt in prompts:
             body: dict[str, object] = {"prompt": prompt.text}
             if prompt.image is not None:
                 body["multi_modal_data"] = {"image": _decode_image(prompt.image)}
             requests.append(body)
+            # Greedy, and only as wide as the slice needs. vLLM batches the
+            # whole list itself, so no manual batching here.
+            sampling.append(
+                self._sampling(  # type: ignore[operator]
+                    temperature=0.0, top_p=1.0, max_tokens=prompt.width(default_width)
+                )
+            )
         outputs = self._llm.generate(  # type: ignore[attr-defined]
-            requests, self._sampling, lora_request=self._lora
+            requests, sampling, lora_request=self._lora
         )
         answers = [output.outputs[0].text.strip() for output in outputs]
         if len(answers) != len(prompts):
@@ -199,9 +262,15 @@ class TransformersRunner:
         self._model.eval()  # type: ignore[attr-defined]
         try:
             self._processor = AutoProcessor.from_pretrained(weights)
-        except (OSError, ValueError):
+        except (OSError, ValueError, KeyError):
             self._processor = None
-        self._tokenizer = AutoTokenizer.from_pretrained(weights)
+        tokenizer = AutoTokenizer.from_pretrained(weights)
+        # Left padding so every row in a batch ends at the same position and
+        # the new tokens can be sliced off by prompt length.
+        tokenizer.padding_side = "left"
+        if tokenizer.pad_token_id is None:
+            tokenizer.pad_token = tokenizer.eos_token
+        self._tokenizer = tokenizer
 
     #: Auto classes to try, in order. The base is a native VLM, so an
     #: image-text-to-text class comes first; the name changed across
@@ -243,30 +312,51 @@ class TransformersRunner:
                 last = exc
         raise RunnerError(f"no transformers auto class could load {weights}") from last
 
-    def generate(self, prompts: Sequence[Prompt]) -> list[str]:  # pragma: no cover
-        import torch
-
+    def generate(self, prompts: Sequence[Prompt]) -> list[str]:
         if self._model is None or self._tokenizer is None:
             raise RunnerError("transformers runner is not initialised")
+        default_width = max_new_tokens()
         answers: list[str] = []
-        width = max_new_tokens()
-        for prompt in prompts:
-            if prompt.image is not None:
-                if self._processor is None:
-                    raise RunnerError("a vision item was scored but the model has no processor")
-                inputs = self._processor(
-                    text=prompt.text, images=_decode_image(prompt.image), return_tensors="pt"
-                )
-            else:
-                inputs = self._tokenizer(prompt.text, return_tensors="pt")
-            inputs = {key: value.to(self._model.device) for key, value in inputs.items()}
-            with torch.no_grad():
-                generated = self._model.generate(  # type: ignore[attr-defined]
-                    **inputs, do_sample=False, max_new_tokens=width
-                )
-            trimmed = generated[0][inputs["input_ids"].shape[-1] :]
-            answers.append(self._tokenizer.decode(trimmed, skip_special_tokens=True).strip())
+        for batch in batches(prompts, batch_size(), default_width):
+            answers.extend(self._generate_batch(batch, batch[0].width(default_width)))
+        if len(answers) != len(prompts):
+            raise RunnerError("transformers returned a different number of answers")
         return answers
+
+    def _generate_batch(self, batch: list[Prompt], width: int) -> list[str]:
+        import torch
+
+        if batch[0].image is not None:
+            if self._processor is None:
+                raise RunnerError("a vision item was scored but the model has no processor")
+            inputs = self._processor(
+                text=batch[0].text,
+                images=_decode_image(batch[0].image),
+                return_tensors="pt",
+            )
+        else:
+            inputs = self._tokenizer(  # type: ignore[misc]
+                [prompt.text for prompt in batch],
+                return_tensors="pt",
+                padding=True,
+            )
+        device = getattr(self._model, "device", None)
+        if device is not None:
+            inputs = {
+                key: value.to(device) if hasattr(value, "to") else value
+                for key, value in inputs.items()
+            }
+        prompt_length = inputs["input_ids"].shape[-1]
+        with torch.no_grad():
+            generated = self._model.generate(  # type: ignore[attr-defined]
+                **inputs, do_sample=False, max_new_tokens=width
+            )
+        return [
+            self._tokenizer.decode(  # type: ignore[union-attr]
+                row[prompt_length:], skip_special_tokens=True
+            ).strip()
+            for row in generated
+        ]
 
     def close(self) -> None:  # pragma: no cover
         self._model = None
