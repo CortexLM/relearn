@@ -30,6 +30,43 @@ relearn-eval score --request request.json --out metrics.json
 # RELEARN_EVAL_OK
 ```
 
+Both markers go to the process's own stdout as well as into `metrics.json`, so
+a harvest that captures only the process output still sees a completed run.
+
+## Making the run fit the timeout
+
+The harvest runs the scorer under `timeout --kill-after=60 <secs>`. A live run
+generates for every holdout item twice, plus every slice the image owns — a
+120-item holdout is around 350 generations and 280 judge calls — so a run that
+does one thing at a time does not finish, and an unfinished run is a 503 with
+nothing to read. What the image does about it:
+
+* **Preflight.** The judge is probed, the base weights are checked for presence,
+  and the artifact is fetched and digest-verified *before* the model is loaded.
+  A pod that cannot score says which dependency is missing in seconds.
+* **Refuses to download the base model** unless `RELEARN_ALLOW_MODEL_DOWNLOAD=1`.
+  Pulling tens of gibibytes inside the run timeout is how a pod spends its whole
+  budget and returns nothing. Prime the pod with `RELEARN_BASE_MODEL_DIR` or a
+  warm Hugging Face cache.
+* **Batched generation** (`RELEARN_BATCH_SIZE`, default 8) and **concurrent
+  judging** (`RELEARN_JUDGE_CONCURRENCY`, default 8). Results stay positional,
+  so concurrency cannot put a score on the wrong item.
+* **Per-slice decode widths.** Open-ended answers get
+  `RELEARN_MAX_NEW_TOKENS` (default 256); a multiple-choice answer gets 8.
+* **Phase logging**, so a run that is killed leaves a tail naming the slice it
+  died in.
+* **`SIGTERM` and `SIGINT` are handled**: a killed run prints one line saying
+  which phase it was in and how long it had been running, then exits non-zero.
+  It never prints a document or a completion marker.
+* **`RELEARN_RUN_BUDGET_SECS`** (optional) stops the run between phases with a
+  reason instead of being killed mid-phase.
+
+To check a pod without scoring on it:
+
+```bash
+relearn-eval preflight --request request.json
+```
+
 `metrics.json` is exactly one line with no trailing newline, because the
 harvest reconstructs the marker line with `printf 'RELEARN_METRICS='; cat
 metrics.json`. `RELEARN_EVAL_OK` is the last thing the process prints, and only
@@ -123,7 +160,12 @@ knows. All of it is pod environment the operator sets.
 | `RELEARN_TEACHER_API_URL` | OpenAI-compatible judge endpoint. **Required**: with no judge the run fails |
 | `RELEARN_TEACHER_API_KEY` | Bearer for that endpoint. Never logged |
 | `RELEARN_TEACHER_MODEL` | Wire id override (default `glm-5.3`) |
-| `RELEARN_BASE_MODEL_DIR` | Local base weights. Preferred over pulling the pinned id per run |
+| `RELEARN_JUDGE_CONCURRENCY` | Judge calls in flight (default 8) |
+| `RELEARN_JUDGE_ATTEMPTS`, `RELEARN_JUDGE_RETRY_SECS` | Retry budget per judge call |
+| `RELEARN_BASE_MODEL_DIR` | Local base weights. **Strongly recommended**: without it the run needs a warm cache or the download opt-in |
+| `RELEARN_ALLOW_MODEL_DOWNLOAD` | Permit pulling the base model inside the run timeout |
+| `RELEARN_BATCH_SIZE` | Prompts per forward pass (default 8) |
+| `RELEARN_RUN_BUDGET_SECS` | Stop between phases rather than be killed mid-phase |
 | `RELEARN_ARTIFACT_DIR` | Content-addressed artifact store, checked first |
 | `RELEARN_ARTIFACT_URL_TEMPLATE` | Fallback fetch, e.g. `.../{digest}.tar` |
 | `RELEARN_IMAGE_STORE` | Content-addressed image store. Required when the holdout has vision items |
@@ -159,6 +201,10 @@ regression on that bench.
   If the model cannot be loaded, the judge cannot be reached, or a vision item's
   pixels are missing, the run ends without a document. A hole in a series would
   be read as a low score nobody measured.
+* **Never silence.** Every failure exits non-zero, writes nothing that looks
+  like a score, and prints one line naming the cause: `no judge: …`,
+  `no model: …`, `artifact: … hashes to …`, `terminated by SIGTERM after Ns
+  during <phase>`, or `run budget of Ns spent during <phase>`.
 * **No second protocol.** `verify.py` and `harvest.py` are mirrors of the
   control plane's checks, used so a transcript this image produces is proven
   acceptable before it is printed.
