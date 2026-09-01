@@ -245,6 +245,19 @@ the harvest can stage the request and run the scorer; any other argument list is
 passed straight to `relearn-eval`, which is how CI and a local operator drive
 the image.
 
+The harvest SSH is non-interactive: `PATH` is typically `/usr/bin:/bin` only.
+`/usr/bin/relearn-eval` is therefore a **regular file** (a wrapper that execs
+the interpreter that can import the package, by absolute path), not a symlink
+into `/usr/local/bin` or a conda prefix. A dangling symlink is the live 127
+(`relearn-eval: No such file or directory`). CI proves
+
+```bash
+env -i PATH=/usr/bin:/bin relearn-eval --help
+env -i PATH=/usr/bin:/bin relearn-eval score --help
+```
+
+inside the published image.
+
 ## Checking a run
 
 ```bash

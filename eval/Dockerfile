@@ -55,26 +55,34 @@ RUN set -eux; \
 WORKDIR /opt/relearn
 COPY pyproject.toml README.md LICENSE ./
 COPY eval/src ./eval/src
+COPY eval/install-cli.sh /tmp/install-cli.sh
 
 RUN set -eux; \
-    if [ -n "${TORCH_INDEX_URL}" ]; then \
-        pip install --extra-index-url "${TORCH_INDEX_URL}" ".[runtime]"; \
-    elif [ "${WITH_RUNTIME}" = "1" ]; then \
-        pip install ".[runtime]"; \
+    if command -v pip >/dev/null 2>&1; then \
+        pip_cmd="pip"; \
     else \
-        pip install "."; \
+        pip_cmd="python3 -m pip"; \
     fi; \
-    ln -sf /usr/local/bin/relearn-eval /usr/bin/relearn-eval; \
-    relearn-eval --help > /dev/null
+    if [ -n "${TORCH_INDEX_URL}" ]; then \
+        $pip_cmd install --extra-index-url "${TORCH_INDEX_URL}" ".[runtime]"; \
+    elif [ "${WITH_RUNTIME}" = "1" ]; then \
+        $pip_cmd install ".[runtime]"; \
+    else \
+        $pip_cmd install "."; \
+    fi; \
+    sh /tmp/install-cli.sh; \
+    rm -f /tmp/install-cli.sh
 
-COPY eval/entrypoint.sh /usr/local/bin/relearn-eval-entrypoint
-RUN chmod 0755 /usr/local/bin/relearn-eval-entrypoint
+# Real files under /usr/bin so a harvest SSH with PATH=/usr/bin:/bin can run
+# them. Do not symlink to /usr/local/bin: that is the live 127.
+COPY eval/entrypoint.sh /usr/bin/relearn-eval-entrypoint
+RUN chmod 0755 /usr/bin/relearn-eval-entrypoint
 
 # Where the control plane stages `request.json` over stdin. Never persisted:
 # the request carries the private holdout for the length of the run only.
 WORKDIR /tmp/relearn_eval
 
-ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/relearn-eval-entrypoint"]
+ENTRYPOINT ["/usr/bin/tini", "--", "/usr/bin/relearn-eval-entrypoint"]
 # `serve` keeps the pod reachable so the harvest can stage and run. Any other
 # argument list is passed straight to `relearn-eval`.
 CMD ["serve"]

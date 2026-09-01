@@ -48,6 +48,9 @@ case "${1:-serve}" in
         serve
         ;;
     *)
-        exec relearn-eval "$@"
+        # Absolute path: this process is started by tini with a full image
+        # PATH, but the harvest SSHes in and runs `relearn-eval` itself with
+        # PATH=/usr/bin:/bin. Keep both paths the same binary.
+        exec /usr/bin/relearn-eval "$@"
         ;;
 esac

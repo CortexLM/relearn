@@ -83,6 +83,20 @@ jobs:
         run: |
           docker run --rm relearn-eval:ci --help | tee /dev/stderr | grep -q "score"
 
+      - name: harvest PATH finds a real relearn-eval
+        # Live 127: SSH is non-interactive, PATH is /usr/bin:/bin, and a
+        # dangling symlink to wherever pip put the console script is
+        # `relearn-eval: No such file or directory`.
+        run: |
+          docker run --rm --entrypoint sh relearn-eval:ci -c \
+            'set -eu; test -f /usr/bin/relearn-eval; ! test -L /usr/bin/relearn-eval; test -x /usr/bin/relearn-eval'
+          docker run --rm --entrypoint env relearn-eval:ci \
+            -i PATH=/usr/bin:/bin relearn-eval --help \
+            | tee /dev/stderr | grep -q "score"
+          docker run --rm --entrypoint env relearn-eval:ci \
+            -i PATH=/usr/bin:/bin relearn-eval score --help \
+            | tee /dev/stderr | grep -q -- "--request"
+
       - name: a pod with no judge refuses, with no document and no OK marker
         run: |
           set +e
