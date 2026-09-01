@@ -53,7 +53,7 @@ from relearn_common.wire import OK_MARKER, encode_line, marker_line
 from .contract import AgentDocument
 from .pins import BASE_CHAMPION_ARTIFACT, ENV_PREFIX, POD_WORKDIR
 from .request import AgentHarvestRequest, read_request
-from .scoring import score_request
+from .scoring import Slices, score_request
 from .teacher import build_teacher
 from .verify import verify_document
 
@@ -90,7 +90,11 @@ def _score(args: argparse.Namespace) -> int:
         ",".join(request.modalities()) or "none",
     )
 
+    # Resolve the judge and the shipped slices before anything expensive: a
+    # missing endpoint or a malformed catalog override should cost a refusal,
+    # not the minutes it takes to pull and load a 27B checkpoint first.
     teacher = build_teacher(request.teacher_model)
+    slices = Slices.load()
     artifact_dir = resolve_artifact(
         request.artifact_digest,
         workdir,
@@ -101,7 +105,7 @@ def _score(args: argparse.Namespace) -> int:
     runner: ModelRunner | None = None
     try:
         runner = build_runner(request.base_model, artifact_dir, prefix=ENV_PREFIX)
-        document = score_request(request, runner, teacher)
+        document = score_request(request, runner, teacher, slices)
         _self_accept(document, request)
         write_sidecar(Path(args.out), document.to_wire())
     finally:

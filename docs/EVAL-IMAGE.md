@@ -5,6 +5,15 @@ numbers is here; the control plane cannot compute a score and has no simulated
 fallback, so a pod that does not return a well-formed, correctly bound document
 is a **503** rather than a verdict.
 
+Two sibling images in this repo score the other live Relearn challenges on the
+same harvest contract: [`IMAGE-EVAL-IMAGE.md`](./IMAGE-EVAL-IMAGE.md) for
+`relearn-image`, and [`AGENT-EVAL-IMAGE.md`](./AGENT-EVAL-IMAGE.md) for
+`relearn-agent`. They print the same markers on purpose, so one harvest client
+shape serves all three; what keeps them apart is the `challenge_id` each
+document carries and the fact that no two challenges' series keys overlap.
+`relearn-agent` shares this challenge's base checkpoint and nothing else about
+how it is measured.
+
 Normative contract: `docs/RELEARN.md` § Eval image contract in
 [`CortexLM/cortex`](https://github.com/CortexLM/cortex). The client is
 `crates/relearn-lium-harvest`. Where this document and those disagree, they win.
