@@ -1,0 +1,6 @@
+# Shebang scripts the harvest execs. A CRLF shebang is the same 127 as a
+# missing file (`timeout: failed to run command '/usr/bin/relearn-eval'`).
+eval/bin/relearn-eval text eol=lf
+eval/install-cli.sh text eol=lf
+eval/entrypoint.sh text eol=lf
+*.sh text eol=lf

@@ -1,0 +1,100 @@
+# syntax=docker/dockerfile:1.7
+#
+# Scoring image. This is the digest the control plane pins.
+#
+# CUDA Ubuntu base — the live pod is a GPU machine, and a slim CPython image
+# is not what harvest boots. `/usr/bin/relearn-eval` is installed here as a
+# *regular file* (COPY + install-cli.sh), not a symlink and not only on the
+# contract-only slim image.
+#
+#   docker build -f eval/Dockerfile.scoring -t relearn-eval:scoring .
+#
+# Installs `.[runtime,vllm]` so Qwen3.8-27B (native VLM) can load: torchvision
+# for Qwen3VLVideoProcessor, vllm as the GPU backend. No model weight, secret,
+# teacher endpoint, or holdout item is baked in here.
+#
+# Both of those imports are proven twice before this file is done — once by the
+# venv python that installed them, and once through `relearn-eval selftest` on
+# the harvest's own PATH — and again by publish-eval-image against the pushed
+# digest. Live `sha256:cbc4bbb8` shipped without either of them.
+
+# Pinned by digest, like the slim base in eval/Dockerfile: the control plane
+# pins *this* image by digest, so a floating base tag would let the bytes under
+# a reviewed digest change without the review.
+ARG BASE_IMAGE=nvidia/cuda:12.8.1-runtime-ubuntu24.04@sha256:ebef3c171eeef0298e4eb2e4be843105edf3b8b0ac45e0b43acee358e8046867
+FROM ${BASE_IMAGE}
+
+ARG WITH_RUNTIME=1
+ARG TORCH_INDEX_URL=""
+ARG RELEARN_GIT_SHA="unknown"
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    HF_HUB_DISABLE_TELEMETRY=1 \
+    HF_HUB_DISABLE_PROGRESS_BARS=1 \
+    TRANSFORMERS_VERBOSITY=error \
+    TOKENIZERS_PARALLELISM=false \
+    RELEARN_GIT_SHA=${RELEARN_GIT_SHA}
+
+# Python on /usr/bin (harvest PATH), sshd so the provider can land, tini so
+# the harvest's SIGTERM reaches the scorer. CUDA Ubuntu does not ship these.
+RUN set -eux; \
+    apt-get update; \
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        ca-certificates curl openssh-server \
+        python3 python3-pip python3-venv; \
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends tini \
+        || curl -fsSL -o /usr/bin/tini \
+            https://github.com/krallin/tini/releases/download/v0.19.0/tini-amd64; \
+    if [ ! -x /usr/bin/tini ]; then \
+        install -m 0755 "$(command -v tini)" /usr/bin/tini; \
+    fi; \
+    chmod 0755 /usr/bin/tini; \
+    rm -rf /var/lib/apt/lists/*; \
+    mkdir -p /run/sshd /root/.ssh; \
+    chmod 700 /root/.ssh; \
+    test -x /usr/bin/python3; \
+    test -x /usr/bin/tini
+
+WORKDIR /opt/relearn
+COPY pyproject.toml README.md LICENSE ./
+COPY eval/src ./eval/src
+COPY eval/install-cli.sh /tmp/install-cli.sh
+COPY eval/bin/relearn-eval /tmp/relearn-eval-launcher
+
+RUN set -eux; \
+    python3 -m venv /opt/relearn-venv; \
+    pip_cmd="/opt/relearn-venv/bin/pip"; \
+    "${pip_cmd}" install --upgrade pip; \
+    if [ -n "${TORCH_INDEX_URL}" ]; then \
+        "${pip_cmd}" install --extra-index-url "${TORCH_INDEX_URL}" ".[runtime,vllm]"; \
+    elif [ "${WITH_RUNTIME}" = "1" ]; then \
+        "${pip_cmd}" install ".[runtime,vllm]"; \
+    else \
+        "${pip_cmd}" install "."; \
+    fi; \
+    /opt/relearn-venv/bin/python -c 'import torchvision; import vllm'; \
+    sh /tmp/install-cli.sh; \
+    rm -f /tmp/install-cli.sh /tmp/relearn-eval-launcher
+
+# Regular file on the scoring path. Last word after pip so a console-script
+# symlink cannot replace it. install-cli.sh already wrote one; this COPY is
+# the same launcher, so `docker history` shows /usr/bin/relearn-eval as a
+# real file layer on the CUDA image.
+COPY eval/bin/relearn-eval /usr/bin/relearn-eval
+COPY eval/entrypoint.sh /usr/bin/relearn-eval-entrypoint
+RUN set -eux; \
+    chmod 0755 /usr/bin/relearn-eval /usr/bin/relearn-eval-entrypoint; \
+    test -f /usr/bin/relearn-eval; \
+    test ! -L /usr/bin/relearn-eval; \
+    test -x /usr/bin/relearn-eval; \
+    env -i PATH=/usr/bin:/bin /usr/bin/relearn-eval --help >/dev/null; \
+    env -i PATH=/usr/bin:/bin /usr/bin/relearn-eval score --help >/dev/null; \
+    env -i PATH=/usr/bin:/bin HOME=/root /usr/bin/relearn-eval selftest
+
+WORKDIR /tmp/relearn_eval
+
+ENTRYPOINT ["/usr/bin/tini", "--", "/usr/bin/relearn-eval-entrypoint"]
+CMD ["serve"]

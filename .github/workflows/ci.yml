@@ -1,0 +1,183 @@
+name: ci
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+      - name: ruff
+        run: ruff check .
+      - name: contract tests
+        run: pytest -q
+
+  scoring-end-to-end:
+    # The live failure was a pod that booted, ran the scorer, and returned no
+    # RELEARN_EVAL_OK. Everything else in the suite patches the model and the
+    # judge; this job loads a real (tiny) model and answers a real judge over a
+    # socket, so `score` exiting 0 with a one-line sidecar and both markers is
+    # asserted on every change rather than discovered on a live pod.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: install with a CPU model runtime
+        run: |
+          python -m pip install --upgrade pip
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip install -e ".[dev]" transformers accelerate peft safetensors
+      - name: score a champion-baseline request end to end
+        run: pytest -q tests/test_end_to_end.py
+
+  image-contract:
+    # Builds the image and drives it exactly as the harvest does: request on
+    # stdin, `relearn-eval score`, then read the markers back. A pod with no
+    # judge and no model runtime must refuse rather than print a document, so
+    # that is what this asserts.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: docker/setup-buildx-action@v3
+      - name: build the contract image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: eval/Dockerfile
+          load: true
+          tags: relearn-eval:ci
+          build-args: |
+            WITH_RUNTIME=0
+            RELEARN_GIT_SHA=${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: stage a dev request
+        run: |
+          pip install -e .
+          python tests/tools/make_request.py --size 8 > "${RUNNER_TEMP}/request.json"
+
+      - name: the entrypoint runs the scorer
+        run: |
+          docker run --rm relearn-eval:ci --help | tee /dev/stderr | grep -q "score"
+
+      - name: harvest PATH finds a real relearn-eval
+        # Live 127: SSH is non-interactive, PATH is /usr/bin:/bin, and a
+        # dangling symlink to wherever pip put the console script is
+        # `relearn-eval: No such file or directory`. This job checks the
+        # slim contract image. The scoring digest is proven the same way
+        # in publish-eval-image, after that job pulls the digest it pushed.
+        run: |
+          docker run --rm --entrypoint sh relearn-eval:ci -c \
+            'set -eu; test -f /usr/bin/relearn-eval; ! test -L /usr/bin/relearn-eval; test -x /usr/bin/relearn-eval'
+          docker run --rm --entrypoint env relearn-eval:ci \
+            -i PATH=/usr/bin:/bin relearn-eval --help \
+            | tee /dev/stderr | grep -q "score"
+          docker run --rm --entrypoint env relearn-eval:ci \
+            -i PATH=/usr/bin:/bin relearn-eval score --help \
+            | tee /dev/stderr | grep -q -- "--request"
+
+      - name: a contract-only image fails selftest, naming what it cannot import
+        # `selftest` is the check the publish job runs against the *pushed
+        # scoring digest*, where it must pass. Here it must fail, and say
+        # torchvision and vllm — the two the live pod on sha256:cbc4bbb8 was
+        # missing. Building the CUDA image on every PR costs a quarter of an
+        # hour, so this is where the mechanism itself is kept honest.
+        run: |
+          set +e
+          docker run --rm relearn-eval:ci selftest 2>"${RUNNER_TEMP}/selftest.log"
+          rc=$?
+          set -e
+          cat "${RUNNER_TEMP}/selftest.log"
+          test "${rc}" -ne 0
+          grep -q "not a scoring image" "${RUNNER_TEMP}/selftest.log"
+          grep -q "torchvision" "${RUNNER_TEMP}/selftest.log"
+          grep -q "vllm" "${RUNNER_TEMP}/selftest.log"
+          docker run --rm --entrypoint env relearn-eval:ci \
+            -i PATH=/usr/bin:/bin /usr/bin/relearn-eval selftest 2>&1 \
+            | tee /dev/stderr | grep -q "not a scoring image"
+
+      - name: a pod with no judge refuses, with no document and no OK marker
+        run: |
+          set +e
+          out=$(docker run --rm -i relearn-eval:ci score --request - --out /tmp/metrics.json \
+                  < "${RUNNER_TEMP}/request.json" 2>"${RUNNER_TEMP}/stderr.log")
+          rc=$?
+          set -e
+          echo "exit=${rc}"
+          cat "${RUNNER_TEMP}/stderr.log"
+          test "${rc}" -ne 0
+          if echo "${out}" | grep -q "RELEARN_EVAL_OK"; then
+            echo "a pod that could not score printed the completion marker"; exit 1
+          fi
+          if echo "${out}" | grep -q "RELEARN_METRICS="; then
+            echo "a pod that could not score printed a document"; exit 1
+          fi
+          grep -q "RELEARN_TEACHER_API_URL" "${RUNNER_TEMP}/stderr.log"
+
+      - name: preflight names the missing dependency
+        run: |
+          set +e
+          docker run --rm -v "${RUNNER_TEMP}:/run:ro" relearn-eval:ci \
+            preflight --request /run/request.json --workdir /tmp/relearn_eval \
+            2>"${RUNNER_TEMP}/preflight.log"
+          rc=$?
+          set -e
+          cat "${RUNNER_TEMP}/preflight.log"
+          test "${rc}" -ne 0
+          grep -q "no judge" "${RUNNER_TEMP}/preflight.log"
+
+      - name: a tampered request is refused
+        run: |
+          python - "${RUNNER_TEMP}/request.json" > "${RUNNER_TEMP}/tampered.json" <<'PY'
+          import json, sys
+          body = json.load(open(sys.argv[1]))
+          body["holdout"][0]["prompt"] = "an item the commitment does not cover"
+          json.dump(body, sys.stdout)
+          PY
+          set +e
+          docker run --rm -i relearn-eval:ci score --request - \
+            < "${RUNNER_TEMP}/tampered.json" 2>"${RUNNER_TEMP}/tampered.log"
+          rc=$?
+          set -e
+          test "${rc}" -ne 0
+          grep -q "commitment mismatch" "${RUNNER_TEMP}/tampered.log"
+
+      - name: silence is not a score
+        run: |
+          printf 'boot ok\nsegfault\n' > "${RUNNER_TEMP}/silent.log"
+          printf 'boot ok\nRELEARN_EVAL_OK\n' > "${RUNNER_TEMP}/marker-only.log"
+          for transcript in silent marker-only; do
+            set +e
+            docker run --rm -v "${RUNNER_TEMP}:/run:ro" relearn-eval:ci \
+              verify --request /run/request.json --transcript "/run/${transcript}.log" \
+              2>"${RUNNER_TEMP}/${transcript}.verify.log"
+            rc=$?
+            set -e
+            cat "${RUNNER_TEMP}/${transcript}.verify.log"
+            test "${rc}" -ne 0
+          done
+          grep -q "did not print RELEARN_EVAL_OK" "${RUNNER_TEMP}/silent.verify.log"
+          grep -q "printed no RELEARN_METRICS=" "${RUNNER_TEMP}/marker-only.verify.log"

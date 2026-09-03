@@ -4,3 +4,9 @@
 *.key
 *.pem
 *.age
+
+# Editable-install metadata
+*.egg-info/
+__pycache__/
+.pytest_cache/
+.ruff_cache/
