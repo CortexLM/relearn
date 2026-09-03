@@ -41,9 +41,10 @@ generates for every holdout item twice, plus every slice the image owns — a
 does one thing at a time does not finish, and an unfinished run is a 503 with
 nothing to read. What the image does about it:
 
-* **Preflight.** The judge is probed, the base weights are checked for presence,
-  and the artifact is fetched and digest-verified *before* the model is loaded.
-  A pod that cannot score says which dependency is missing in seconds.
+* **Preflight.** The judge is probed, the scoring runtime is imported, the base
+  weights are checked for presence, and the artifact is fetched and
+  digest-verified *before* the model is loaded. A pod that cannot score says
+  which dependency is missing in seconds.
 * **Refuses to download the base model** unless `RELEARN_ALLOW_MODEL_DOWNLOAD=1`.
   Pulling tens of gibibytes inside the run timeout is how a pod spends its whole
   budget and returns nothing. Prime the pod with `RELEARN_BASE_MODEL_DIR` or a
@@ -64,8 +65,39 @@ nothing to read. What the image does about it:
 To check a pod without scoring on it:
 
 ```bash
-relearn-eval preflight --request request.json
+relearn-eval preflight --request request.json   # needs a request and a judge
+relearn-eval selftest                           # needs neither
 ```
+
+## The scoring runtime
+
+The scoring image is a CUDA build of `eval/Dockerfile.scoring`, and it installs
+`.[runtime,vllm]`. Two of those wheels are the difference between a pod that
+scores and a pod that burns the rent:
+
+| Import | Without it |
+|--------|------------|
+| `vllm` | `auto` falls back to transformers, which is the slow way to overrun the harvest's timeout |
+| `torchvision` | the native VLM base dies building its processor: `ImportError: Qwen3VLVideoProcessor requires Torchvision` |
+| `torch`, `transformers` | no backend at all |
+| `pillow` | holdout images cannot be decoded |
+
+That pair is exactly what live `sha256:cbc4bbb8` was missing: it came up
+RUNNING, skipped vLLM because it was not installed, and exited 1 on the
+torchvision import minutes into loading the 27B base, so no champion was
+recorded. The build imports them, but the build is not what a pod boots, so
+they are checked where it counts:
+
+```bash
+relearn-eval selftest   # every scoring dependency, or exit 2 naming what is missing
+```
+
+`selftest` takes no request and needs no judge, so it can run against a pulled
+digest. The publish job runs it on the bytes it just pushed, through
+`PATH=/usr/bin:/bin`, which answers in one command both "is
+`/usr/bin/relearn-eval` runnable on the harvest's PATH" and "can the python it
+picks import the runtime". A contract-only build fails it, which is intended: a
+slim digest is not one the control plane may pin.
 
 `metrics.json` is exactly one line with no trailing newline, because the
 harvest reconstructs the marker line with `printf 'RELEARN_METRICS='; cat
@@ -231,9 +263,12 @@ and, **in the same job**, pulls that digest and runs
 ```bash
 docker run --rm --entrypoint /bin/sh DIGEST -c \
   'test -f /usr/bin/relearn-eval && test -x /usr/bin/relearn-eval && env -i PATH=/usr/bin:/bin /usr/bin/relearn-eval --help'
+docker run --rm --entrypoint /opt/relearn-venv/bin/python DIGEST -c 'import vllm, torchvision'
+docker run --rm --entrypoint /bin/sh DIGEST -c \
+  'env -i PATH=/usr/bin:/bin HOME=/root /usr/bin/relearn-eval selftest'
 ```
 
-If that fails, the job fails and no pin is reported. Put a passing digest —
+If any of those fails, the job fails and no pin is reported. Put a passing digest —
 never a tag, never a contract-only digest — in `eval_image_digest` in the
 control plane's `config/relearn-pin.toml`, together with this repo's git SHA in
 `relearn_git_sha`, and re-sign the trust root.
@@ -261,7 +296,11 @@ scoring digest:
 ```bash
 env -i PATH=/usr/bin:/bin /usr/bin/relearn-eval --help
 env -i PATH=/usr/bin:/bin /usr/bin/relearn-eval score --help
+env -i PATH=/usr/bin:/bin HOME=/root /usr/bin/relearn-eval selftest
 ```
+
+Both Dockerfiles pin their base by digest, so the bytes under a reviewed digest
+cannot change without the review.
 
 ## Checking a run
 
