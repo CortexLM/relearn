@@ -21,8 +21,9 @@ from pathlib import Path
 
 from .artifact import ArtifactError, resolve_artifact
 from .contract import ContractError
+from .deps import CORE, GPU, VISION, describe, missing, report
 from .request import HarvestRequest
-from .runner import RunnerError, resolve_base_model
+from .runner import RunnerError, resolve_base_model, selected_backend
 from .teacher import HttpTeacher, TeacherError, build_teacher
 
 log = logging.getLogger(__name__)
@@ -75,6 +76,53 @@ def check_teacher(request: HarvestRequest) -> HttpTeacher:
         raise PreflightError(f"no judge: {teacher.model} did not answer: {exc}") from exc
     log.info("judge reachable: model=%s", teacher.model)
     return teacher
+
+
+def check_scoring_runtime(request: HarvestRequest) -> None:
+    """Prove the image can import what loading this run's model will need.
+
+    The live failure: `sha256:cbc4bbb8` passed preflight, spent the rent
+    loading, and died on `Qwen3VLVideoProcessor requires Torchvision` with no
+    vLLM to fall back from. Every one of those imports is knowable here.
+
+    What is fatal depends on the run rather than on a fixed list: the vision
+    imports only when the holdout carries vision items, and vLLM only when the
+    operator asked for it by name, because `auto` is allowed to fall back to
+    transformers. `relearn-eval selftest` is the stricter check, and it is what
+    CI runs against a published digest before it is pinned.
+
+    # Raises
+    [`PreflightError`] naming every missing package and what needs it.
+    """
+    try:
+        backend = selected_backend()
+    except RunnerError as exc:
+        raise PreflightError(f"runtime: {exc}") from exc
+    needed = CORE
+    families = request.vision_families()
+    if families:
+        needed += VISION
+    if backend == "vllm":
+        needed += GPU
+
+    absent = missing(needed)
+    if absent:
+        raise PreflightError(
+            f"runtime: this image cannot import {describe(absent)}. "
+            "The scoring image is built from eval/Dockerfile.scoring with the "
+            "[runtime,vllm] extras; a pod booted from any other build cannot score"
+        )
+
+    # Not fatal, but the operator rented a GPU for vLLM and is about to get the
+    # transformers path instead, which is the slow way to overrun the timeout.
+    if backend == "auto" and missing(GPU):
+        log.warning("vllm is not importable in this image; the run will use transformers")
+    if not families and missing(VISION):
+        log.warning(
+            "torchvision is not importable in this image; a native VLM base "
+            "will fail to build its processor"
+        )
+    log.info("runtime: backend=%s %s", backend, ", ".join(report()))
 
 
 def check_base_weights(request: HarvestRequest) -> str:
@@ -149,6 +197,7 @@ class Ready:
 def preflight(request: HarvestRequest, workdir: Path) -> Ready:
     """Prove the pod can score this run, in seconds rather than minutes."""
     teacher = check_teacher(request)
+    check_scoring_runtime(request)
     base_model = check_base_weights(request)
     artifact_dir = check_artifact(request, workdir)
     log.info(

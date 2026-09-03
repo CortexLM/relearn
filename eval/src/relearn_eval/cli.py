@@ -41,6 +41,7 @@ from .contract import (
     encode_document,
     marker_line,
 )
+from .deps import SCORING, report, require
 from .harvest import accept
 from .preflight import preflight
 from .progress import Budget, Phase, Terminated, budget_seconds
@@ -172,6 +173,24 @@ def _read_and_check(args: argparse.Namespace) -> HarvestRequest:
     return request
 
 
+def _selftest(_args: argparse.Namespace) -> int:
+    """Prove this image is a scoring image, with no request and no judge.
+
+    This is what CI runs against the digest it just pushed, through the
+    harvest's own `PATH=/usr/bin:/bin`, so one command answers both of the
+    questions a live 127 and a live `Qwen3VLVideoProcessor requires
+    Torchvision` each answered too late: is `/usr/bin/relearn-eval` runnable
+    here, and can the python it selects import the scoring runtime.
+
+    A contract-only build fails this, which is the point — it is not a digest
+    the control plane may pin.
+    """
+    log.info("runtime: %s", ", ".join(report()))
+    require(SCORING, "this is not a scoring image")
+    log.info("this image can score: every scoring dependency imports")
+    return 0
+
+
 def _preflight(args: argparse.Namespace) -> int:
     """Check the pod without scoring, so an operator can debug a pod cheaply."""
     request = _read_and_check(args)
@@ -279,6 +298,12 @@ def build_parser() -> argparse.ArgumentParser:
     check.add_argument("--request", default="request.json")
     check.add_argument("--workdir", default=POD_WORKDIR)
     check.set_defaults(handler=_preflight)
+
+    runtime = subcommands.add_parser(
+        "selftest",
+        help="check this image ships the scoring runtime (no request, no judge)",
+    )
+    runtime.set_defaults(handler=_selftest)
 
     return parser
 

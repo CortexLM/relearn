@@ -16,7 +16,7 @@ import json
 
 import pytest
 
-from relearn_eval import METRICS_MARKER, OK_MARKER, accept, decode_document
+from relearn_eval import METRICS_MARKER, OK_MARKER, accept, decode_document, deps
 from relearn_eval.cli import EXIT_REFUSED, main
 from relearn_eval.preflight import PreflightError
 from relearn_eval.request import HarvestRequest
@@ -248,6 +248,32 @@ def test_the_boot_baseline_document_is_installable_as_a_champion_file(
     for key in ("eval_image_digest", "holdout_commitment", "holdout", "public", "general_canary"):
         assert key in body
     assert body["holdout_commitment"] == request.holdout_commitment
+
+
+def test_selftest_refuses_an_image_that_cannot_import_the_scoring_runtime(
+    monkeypatch, capsys, caplog
+):
+    """What a contract-only build must say, and what `cbc4bbb8` should have said.
+
+    The publish job runs this against the digest it pushed, so a scoring image
+    that shipped without vLLM or torchvision never reaches a pin.
+    """
+    monkeypatch.setattr(deps, "version", lambda _dependency: None)
+    assert main(["selftest"]) == EXIT_REFUSED
+    assert "not a scoring image" in caplog.text
+    for package in ("torch", "torchvision", "vllm"):
+        assert package in caplog.text
+    # No document, no marker: nothing a harvest could mistake for a scored run.
+    assert capsys.readouterr().out == ""
+
+
+def test_selftest_passes_on_an_image_that_ships_the_scoring_runtime(
+    monkeypatch, capsys, caplog
+):
+    monkeypatch.setattr(deps, "version", lambda _dependency: "9.9.9")
+    assert main(["selftest"]) == 0
+    assert capsys.readouterr().out == ""
+    assert OK_MARKER not in caplog.text
 
 
 def test_score_needs_no_slice_argument_beyond_the_request(staged, tmp_path, wired):
