@@ -89,6 +89,39 @@ def test_publish_scoring_job_pulls_the_digest_it_just_pushed():
         "test -f /usr/bin/relearn-eval && test -x /usr/bin/relearn-eval && "
         "env -i PATH=/usr/bin:/bin /usr/bin/relearn-eval --help"
     ) in body
-    pull_at = body.index("pull the published digest and prove harvest PATH")
+    pull_at = body.index("pull the published digest and prove it can score")
     report_at = body.index("report the digest to pin")
     assert pull_at < report_at
+
+
+def test_publish_proves_the_scoring_runtime_on_the_pushed_digest():
+    """Live `sha256:cbc4bbb8` was pinnable without vLLM or torchvision in it.
+
+    The build imports them, but the build is not what a pod boots. These two
+    checks run against the bytes that were pushed, before a digest is reported
+    as pinnable, and they must stay ahead of that report.
+    """
+    body = (REPO / ".github" / "workflows" / "publish-eval-image.yml").read_text(
+        encoding="utf-8"
+    )
+    assert "-c 'import vllm, torchvision'" in body
+    assert "/usr/bin/relearn-eval selftest" in body
+    assert body.index("import vllm, torchvision") < body.index("report the digest to pin")
+
+
+def test_the_scoring_dockerfile_pins_its_base_by_digest():
+    """A floating base tag would change the bytes under a reviewed digest."""
+    body = (REPO / "eval" / "Dockerfile.scoring").read_text(encoding="utf-8")
+    base = next(line for line in body.splitlines() if line.startswith("ARG BASE_IMAGE="))
+    assert "@sha256:" in base
+
+
+def test_the_scoring_dockerfile_selftests_on_the_harvest_path():
+    body = (REPO / "eval" / "Dockerfile.scoring").read_text(encoding="utf-8")
+    assert "PATH=/usr/bin:/bin HOME=/root /usr/bin/relearn-eval selftest" in body
+
+
+def test_the_contract_dockerfile_does_not_claim_to_be_a_scoring_image():
+    """A slim build must fail `selftest`, so it can never be built to pass it."""
+    body = (REPO / "eval" / "Dockerfile").read_text(encoding="utf-8")
+    assert "relearn-eval selftest" not in body

@@ -99,6 +99,26 @@ jobs:
             -i PATH=/usr/bin:/bin relearn-eval score --help \
             | tee /dev/stderr | grep -q -- "--request"
 
+      - name: a contract-only image fails selftest, naming what it cannot import
+        # `selftest` is the check the publish job runs against the *pushed
+        # scoring digest*, where it must pass. Here it must fail, and say
+        # torchvision and vllm — the two the live pod on sha256:cbc4bbb8 was
+        # missing. Building the CUDA image on every PR costs a quarter of an
+        # hour, so this is where the mechanism itself is kept honest.
+        run: |
+          set +e
+          docker run --rm relearn-eval:ci selftest 2>"${RUNNER_TEMP}/selftest.log"
+          rc=$?
+          set -e
+          cat "${RUNNER_TEMP}/selftest.log"
+          test "${rc}" -ne 0
+          grep -q "not a scoring image" "${RUNNER_TEMP}/selftest.log"
+          grep -q "torchvision" "${RUNNER_TEMP}/selftest.log"
+          grep -q "vllm" "${RUNNER_TEMP}/selftest.log"
+          docker run --rm --entrypoint env relearn-eval:ci \
+            -i PATH=/usr/bin:/bin /usr/bin/relearn-eval selftest 2>&1 \
+            | tee /dev/stderr | grep -q "not a scoring image"
+
       - name: a pod with no judge refuses, with no document and no OK marker
         run: |
           set +e

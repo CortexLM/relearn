@@ -112,12 +112,21 @@ jobs:
           # is past what the Actions cache will hold, and a failed cache
           # export would fail a build that otherwise produced a pinnable
           # digest.
-      - name: pull the published digest and prove harvest PATH
-        # Live 127 on sha256:86240d76: the scoring image harvest booted did
-        # not contain a runnable /usr/bin/relearn-eval. CI's harvest-PATH
-        # check had only ever run against the slim contract image. This
-        # step pulls the digest we just pushed — the bytes a pod will get —
-        # and refuses to report a pin if the file is missing or 127s.
+      - name: pull the published digest and prove it can score
+        # Two live failures, both of them shapes the build could not see.
+        #
+        # sha256:86240d76 — the scoring image harvest booted had no runnable
+        # /usr/bin/relearn-eval (exit 127). CI's harvest-PATH check had only
+        # ever run against the slim contract image.
+        #
+        # sha256:cbc4bbb8 — the pod ran, skipped vLLM because it was not
+        # installed, and died loading the native VLM base on
+        # `Qwen3VLVideoProcessor requires Torchvision`. Nothing checked the
+        # runtime the pod would actually import.
+        #
+        # So this pulls the digest just pushed — the bytes a pod will get —
+        # and refuses to report a pin unless that image both runs on the
+        # harvest's PATH and imports the scoring runtime.
         env:
           DIGEST: ${{ steps.push.outputs.digest }}
         run: |
@@ -134,6 +143,14 @@ jobs:
             'test ! -L /usr/bin/relearn-eval'
           docker run --rm --entrypoint /bin/sh "${ref}" -c \
             'env -i PATH=/usr/bin:/bin /usr/bin/relearn-eval score --help'
+          # The plainest possible statement of what cbc4bbb8 was missing.
+          docker run --rm --entrypoint /opt/relearn-venv/bin/python "${ref}" \
+            -c 'import vllm, torchvision'
+          # And the same question asked the way the harvest asks it: through
+          # /usr/bin/relearn-eval on the PATH an SSH login gets, so this also
+          # covers the launcher picking an interpreter that cannot import them.
+          docker run --rm --entrypoint /bin/sh "${ref}" -c \
+            'env -i PATH=/usr/bin:/bin HOME=/root /usr/bin/relearn-eval selftest'
       - name: report the digest to pin
         env:
           DIGEST: ${{ steps.push.outputs.digest }}
@@ -146,7 +163,8 @@ jobs:
           {
             echo "### relearn-eval (scoring image, CUDA base)"
             echo
-            echo "Pulled this digest after push and ran the harvest-PATH check."
+            echo "Pulled this digest after push, ran the harvest-PATH check,"
+            echo "and proved \`import vllm, torchvision\` on these bytes."
             echo "Paste into the control plane's \`config/relearn-pin.toml\`:"
             echo
             echo '```toml'

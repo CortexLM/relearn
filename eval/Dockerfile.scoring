@@ -12,8 +12,16 @@
 # Installs `.[runtime,vllm]` so Qwen3.8-27B (native VLM) can load: torchvision
 # for Qwen3VLVideoProcessor, vllm as the GPU backend. No model weight, secret,
 # teacher endpoint, or holdout item is baked in here.
+#
+# Both of those imports are proven twice before this file is done — once by the
+# venv python that installed them, and once through `relearn-eval selftest` on
+# the harvest's own PATH — and again by publish-eval-image against the pushed
+# digest. Live `sha256:cbc4bbb8` shipped without either of them.
 
-ARG BASE_IMAGE=nvidia/cuda:12.8.1-runtime-ubuntu24.04
+# Pinned by digest, like the slim base in eval/Dockerfile: the control plane
+# pins *this* image by digest, so a floating base tag would let the bytes under
+# a reviewed digest change without the review.
+ARG BASE_IMAGE=nvidia/cuda:12.8.1-runtime-ubuntu24.04@sha256:ebef3c171eeef0298e4eb2e4be843105edf3b8b0ac45e0b43acee358e8046867
 FROM ${BASE_IMAGE}
 
 ARG WITH_RUNTIME=1
@@ -83,7 +91,8 @@ RUN set -eux; \
     test ! -L /usr/bin/relearn-eval; \
     test -x /usr/bin/relearn-eval; \
     env -i PATH=/usr/bin:/bin /usr/bin/relearn-eval --help >/dev/null; \
-    env -i PATH=/usr/bin:/bin /usr/bin/relearn-eval score --help >/dev/null
+    env -i PATH=/usr/bin:/bin /usr/bin/relearn-eval score --help >/dev/null; \
+    env -i PATH=/usr/bin:/bin HOME=/root /usr/bin/relearn-eval selftest
 
 WORKDIR /tmp/relearn_eval
 
